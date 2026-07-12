@@ -2,288 +2,178 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<title>Agent Roundtable — Codex, Antigravity & Claude Code</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh;
-    background: radial-gradient(circle at 50% 0%, #1b1f2a 0%, #0d0f14 60%);
-    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
-    color: #e8e8ec;
-  }
-  .layout { display: flex; min-height: 100vh; }
-
-  .sidebar {
-    width: 240px; flex-shrink: 0; background: #14171f; border-right: 1px solid #2a2f3a;
-    padding: 16px 12px; display: flex; flex-direction: column; gap: 10px;
-  }
-  .sidebar h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #7a7f8c; margin: 4px 6px; }
-  .sidebar button.new-session {
-    width: 100%; background: #22262f; color: #e8e8ec; border: 1px dashed #3a3f4a;
-  }
-  .session-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
-  .session-item {
-    text-align: left; background: transparent; color: #c7cad3; border: 1px solid transparent;
-    border-radius: 8px; padding: 8px 10px; font-size: 12.5px; cursor: pointer; font-weight: 400;
-  }
-  .session-item:hover { background: #1d212b; }
-  .session-item.active { background: #1d2636; border-color: #5b8def; }
-  .session-item .s-topic { display: block; color: #e8e8ec; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .session-item .s-meta { display: block; font-size: 10.5px; color: #7a7f8c; }
-
-  .main { flex: 1; padding: 40px 16px; min-width: 0; }
-
-  h1 { text-align: center; font-size: 22px; font-weight: 600; margin: 0 0 4px; }
-  .status { text-align: center; color: #9a9aa5; font-size: 13px; margin-bottom: 12px; }
-
-  .viewing-banner {
-    max-width: 760px; margin: 0 auto 16px; background: #2a2410; border: 1px solid #f5c542;
-    border-radius: 10px; padding: 10px 16px; display: flex; align-items: center; justify-content: space-between;
-    gap: 12px; font-size: 12.5px; color: #f0d98c;
-  }
-  .viewing-banner button { padding: 6px 12px; font-size: 12px; }
-
-  .conn {
-    max-width: 760px; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;
-    gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: #c7cad3;
-    background: #181c24; border: 1px solid #2a2f3a; border-radius: 10px; padding: 8px 14px;
-  }
-  .conn-item { display: inline-flex; align-items: center; gap: 5px; }
-  .conn-item small { color: #7a7f8c; }
-
-  .topic {
-    max-width: 760px; margin: 0 auto 20px; text-align: center; font-size: 13.5px;
-    color: #c7cad3; background: #181c24; border: 1px solid #2a2f3a; border-radius: 10px; padding: 10px 16px;
-  }
-  .feed { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
-  .row { display: flex; }
-  .row.left { justify-content: flex-start; }
-  .row.right { justify-content: flex-end; }
-  .row.center { justify-content: center; }
-  .bubble {
-    max-width: 78%; background: #181c24; border: 1px solid #2a2f3a;
-    border-left: 3px solid var(--accent); border-radius: 12px; padding: 12px 16px;
-  }
-  .row.right .bubble { border-left: none; border-right: 3px solid var(--accent); }
-  .row.center .bubble { border-left: none; border: 1px dashed var(--accent); max-width: 90%; }
-  .row.report .bubble { border: 2px solid #f5c542; background: #23200f; max-width: 90%; }
-  .row.confirm .bubble { border: 2px solid #5b8def; background: #101a2e; max-width: 90%; }
-  .approve-banner {
-    max-width: 760px; margin: 20px auto 0; background: #101a2e; border: 2px solid #5b8def;
-    border-radius: 12px; padding: 16px 18px; text-align: center;
-  }
-  .approve-banner p { margin: 0 0 12px; font-size: 13.5px; color: #dbe6ff; }
-  .approve-banner button { background: #5b8def; }
-  .mode-choice { display: flex; gap: 16px; font-size: 13px; color: #c7cad3; margin: 10px 0 4px; }
-  .mode-choice label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-  .meta { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
-  .name { font-weight: 700; font-size: 13px; color: var(--accent); }
-  .phase { font-size: 11px; color: #7a7f8c; background: #22262f; padding: 2px 8px; border-radius: 999px; }
-  .time { font-size: 11px; color: #5c6070; margin-left: auto; }
-  .text { font-size: 14.5px; line-height: 1.55; }
-  .text strong { color: #f2f3f6; }
-  .text code {
-    background: #22262f; padding: 1px 6px; border-radius: 4px; font-size: 13px;
-    font-family: "SF Mono", Consolas, monospace;
-  }
-  .text a { color: var(--accent); text-decoration: underline; }
-  .text ol, .text ul { margin: 4px 0 8px; padding-left: 22px; }
-  .text li { margin: 3px 0; }
-  .stats { margin-top: 8px; font-size: 10.5px; color: #5c6070; }
-
-  .panel {
-    max-width: 760px; margin: 20px auto 0; background: #181c24; border: 1px solid #2a2f3a;
-    border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px;
-  }
-  .panel-row { display: flex; gap: 10px; flex-wrap: wrap; }
-  button {
-    border: none; border-radius: 8px; padding: 10px 16px; font-size: 13.5px; font-weight: 600;
-    cursor: pointer; color: #0d0f14; background: #5b8def;
-  }
-  button.secondary { background: #2a2f3a; color: #e8e8ec; }
-  button.danger { background: #e06060; }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-  textarea {
-    width: 100%; box-sizing: border-box; min-height: 70px; resize: vertical; background: #0d0f14;
-    border: 1px solid #2a2f3a; border-radius: 8px; color: #e8e8ec; font-size: 14px; padding: 10px;
-    font-family: inherit;
-  }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Roundtable</title>
+<link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
-<div class="layout">
-  <div class="sidebar">
-    <h2>세션</h2>
-    <button class="new-session" onclick="restartSession()">+ 새 세션</button>
+<div class="app-shell">
+  <aside class="sidebar" aria-label="세션 목록">
+    <div class="brand">
+      <div class="brand-mark">AR</div>
+      <div>
+        <h1>Agent Roundtable</h1>
+        <p>Codex style workspace</p>
+      </div>
+    </div>
+    <button class="new-session" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>새 세션</button>
+    <div class="sidebar-section-title">Sessions</div>
     <div class="session-list" id="sessionList"></div>
-  </div>
+  </aside>
 
-  <div class="main">
-    <h1>🗣️ Codex <span style="color:#5c6070">·</span> Antigravity <span style="color:#5c6070">·</span> Claude Code</h1>
-    <div class="status" id="status">__STATUS__</div>
-    <div class="conn" id="conn">
-      __CONN_HTML__
-      <button class="secondary" onclick="recheck()" style="padding:4px 10px;font-size:12px">다시 확인</button>
-    </div>
-
-    <div class="viewing-banner" id="viewingBanner" style="display:none">
-      <span>📖 지난 세션을 보는 중입니다 (읽기 전용)</span>
-      <button onclick="backToLive()">현재 세션으로 돌아가기</button>
-    </div>
-
-    <div id="topicSection">__TOPIC_SECTION__</div>
-    <div class="feed" id="feed">__FEED__</div>
-
-    <div class="approve-banner" id="approveBanner" style="display:none">
-      <p>⏸ 위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
-      <button onclick="approveWork()">✅ 승인하고 코딩 진행</button>
-    </div>
-
-    <div class="panel" id="controlPanel">
-      <div class="panel-row">
-        <button id="pauseBtn" onclick="ctrl('pause')" __PAUSE_DISABLED__>⏸ 일시정지</button>
-        <button id="resumeBtn" class="secondary" onclick="ctrl('resume')" __RESUME_DISABLED__>▶ 재개</button>
-        <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__>■ 중단하기</button>
-        <button class="secondary" onclick="restartSession()">⟳ 새 세션</button>
+  <main class="thread">
+    <header class="thread-header">
+      <div>
+        <div class="eyebrow">Roundtable</div>
+        <h2>Codex · Antigravity · Claude Code</h2>
       </div>
-      <div class="panel-row" style="flex-direction:column">
-        <textarea id="msgText" placeholder="대화에 끼어들어 메시지를 보내세요 (다음 에이전트가 참고합니다)" __NO_TOPIC__></textarea>
-        <button onclick="sendMessage()" __NO_TOPIC__>내 메시지 보내기</button>
+      <div class="status-pill" id="status">__STATUS__</div>
+    </header>
+
+    <section class="connection-bar" id="conn">
+      <div class="conn-list">__CONN_HTML__</div>
+      <button class="ghost compact" onclick="recheck()"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>다시 확인</button>
+    </section>
+
+    <section class="viewing-banner" id="viewingBanner" style="display:none">
+      <span>지난 세션을 읽는 중입니다.</span>
+      <button class="ghost compact" onclick="backToLive()">현재 세션</button>
+    </section>
+
+    <section id="topicSection">__TOPIC_SECTION__</section>
+    <section class="feed" id="feed">__FEED__</section>
+
+    <section id="thinkingIndicator" class="thinking-card" style="display:none">
+      <div class="spinner"></div>
+      <div class="thinking-text">생각 중...</div>
+    </section>
+
+    <section class="approve-banner" id="approveBanner" style="display:none">
+      <p id="approveHint">위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
+      <div class="approve-actions">
+        <button onclick="approveWork()"><svg viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>승인하고 코딩 진행</button>
+        <button class="ghost" onclick="deferApproval()"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>보류</button>
+      </div>
+      <div class="approval-input">
+        <select id="approvalIntent" aria-label="승인 전 개입 유형">
+          <option value="question">질문</option>
+          <option value="redirect">수정 요청</option>
+          <option value="hold">멈추고 답변</option>
+        </select>
+        <div class="target-choice" aria-label="승인 전 대상 모델">
+          <label><input type="checkbox" name="approvalTarget" value="codex" checked> Codex</label>
+          <label><input type="checkbox" name="approvalTarget" value="antigravity" checked> Antigravity</label>
+          <label><input type="checkbox" name="approvalTarget" value="claude" checked> Claude</label>
+        </div>
+        <textarea id="approvalMsgText" placeholder="승인 전에 질문하거나 수정 요청을 남기세요"></textarea>
+        <button class="ghost" onclick="sendApprovalMessage()"><svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>질문/수정 요청 보내기</button>
+      </div>
+    </section>
+
+    <section class="composer" id="controlPanel">
+      <div class="composer-actions">
+        <button id="pauseBtn" class="ghost" onclick="ctrl('pause')" __PAUSE_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>일시정지</button>
+        <button id="resumeBtn" class="ghost" onclick="ctrl('resume')" __RESUME_DISABLED__><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>재개</button>
+        <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>중단</button>
+        <button class="ghost" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>새 세션</button>
+        <select id="composerModeSelect" aria-label="채팅 모드">
+          <option value="discussion">토론 모드</option>
+          <option value="coding">코딩 모드</option>
+        </select>
+        <button class="ghost" onclick="changeSessionMode('composer')">모드 전환</button>
+      </div>
+      <div class="message-box">
+        <select id="interventionIntent" aria-label="개입 유형" __NO_TOPIC__>
+          <option value="question">질문</option>
+          <option value="redirect" selected>방향 수정</option>
+          <option value="hold">멈추고 답변</option>
+          <option value="note">참고만</option>
+        </select>
+        <div class="target-choice" aria-label="대상 모델">
+          <label><input type="checkbox" name="interventionTarget" value="codex" checked> Codex</label>
+          <label><input type="checkbox" name="interventionTarget" value="antigravity" checked> Antigravity</label>
+          <label><input type="checkbox" name="interventionTarget" value="claude" checked> Claude</label>
+        </div>
+        <textarea id="msgText" placeholder="Codex처럼 진행에 개입하세요. 질문, 방향 수정, 멈추고 답변 등을 선택할 수 있습니다." __NO_TOPIC__></textarea>
+        <button onclick="sendMessage()" __NO_TOPIC__><svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>보내기</button>
+      </div>
+    </section>
+  </main>
+
+  <aside class="inspector" aria-label="세션 메타">
+    <div class="inspector-card live-card" id="liveCard">
+      <div class="card-title">Live</div>
+      <div class="live-line" id="liveLine">대기 중</div>
+      <div class="live-detail" id="liveDetail">모델 호출이 시작되면 여기에 표시됩니다.</div>
+    </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Session</div>
+      <div class="metric-row">
+        <span>상태</span>
+        <strong id="sideStatus">__STATUS__</strong>
+      </div>
+      <div class="metric-row">
+        <span>모드</span>
+        <strong id="sideMode">-</strong>
+      </div>
+      <div class="mode-switcher">
+        <select id="sessionModeSelect" aria-label="세션 모드">
+          <option value="discussion">토론 모드</option>
+          <option value="coding">코딩 모드</option>
+        </select>
+        <button class="ghost compact" onclick="changeSessionMode()">전환</button>
+      </div>
+      <div class="metric-row">
+        <span>메시지</span>
+        <strong id="sideMessages">0</strong>
       </div>
     </div>
-  </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Usage</div>
+      <div class="usage-grid">
+        <div>
+          <span>Tokens</span>
+          <strong id="statTokens">0</strong>
+        </div>
+        <div>
+          <span>Time</span>
+          <strong id="statTime">0.0s</strong>
+        </div>
+        <div>
+          <span>Cost</span>
+          <strong id="statCost">$0.0000</strong>
+        </div>
+      </div>
+    </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Agents</div>
+      <div class="agent-stack" id="agentStack"></div>
+    </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Memory</div>
+      <p class="memory-path" id="memoryPath">세션 시작 후 표시됩니다.</p>
+      <p class="memory-path" id="profilePath">Profile.md도 여기에 표시됩니다.</p>
+      <button class="ghost compact" onclick="openProfileEditor()">Profile.md 열기</button>
+      <div class="profile-editor" id="profileEditor" style="display:none">
+        <textarea id="profileContent" spellcheck="false"></textarea>
+        <div class="profile-actions">
+          <button class="ghost compact" onclick="saveProfileEditor()">저장</button>
+          <button class="ghost compact" onclick="closeProfileEditor()">닫기</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Runtime</div>
+      <div class="runtime-log" id="runtimeLog"></div>
+    </div>
+  </aside>
 </div>
 
-<script>
-let viewingId = null;  // null이면 현재 진행 중인 세션을 실시간으로 본다
-
-function renderSessionList(sessions, activeId) {
-  const list = document.getElementById('sessionList');
-  if (!sessions.length) {
-    list.innerHTML = '<p style="color:#5c6070;font-size:12px;padding:6px">아직 세션이 없습니다.</p>';
-    return;
-  }
-  list.innerHTML = sessions.map(s => {
-    const cls = 'session-item' + (s.id === (viewingId || activeId) ? ' active' : '');
-    const statusIcon = s.finished ? '✅' : (s.id === activeId ? '🟢' : '⏸');
-    return `<button class="${cls}" onclick="viewSession('${s.id}')">
-      <span class="s-topic">${statusIcon} ${escapeHtml(s.topic)}</span>
-      <span class="s-meta">${s.mode_label} · ${s.message_count}개 메시지</span>
-    </button>`;
-  }).join('');
-}
-
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
-}
-
-async function loadSessions() {
-  try {
-    const r = await fetch('/sessions.json');
-    const data = await r.json();
-    renderSessionList(data.sessions, data.active_id);
-  } catch (e) {}
-}
-
-async function viewSession(id) {
-  const r = await fetch('/session.json?id=' + encodeURIComponent(id));
-  if (!r.ok) return;
-  const data = await r.json();
-  if (data.is_active) {
-    viewingId = null;
-    document.getElementById('viewingBanner').style.display = 'none';
-    document.getElementById('controlPanel').style.display = 'flex';
-    poll();
-  } else {
-    viewingId = id;
-    document.getElementById('feed').innerHTML = data.feed_html;
-    document.getElementById('topicSection').innerHTML = data.topic
-      ? '<div class="topic">📌 ' + data.topic + ' <span style="opacity:.6">· ' + data.mode_label + '</span></div>'
-      : '';
-    document.getElementById('viewingBanner').style.display = 'flex';
-    document.getElementById('controlPanel').style.display = 'none';
-    document.getElementById('approveBanner').style.display = 'none';
-  }
-  loadSessions();
-}
-
-function backToLive() {
-  viewingId = null;
-  document.getElementById('viewingBanner').style.display = 'none';
-  document.getElementById('controlPanel').style.display = 'flex';
-  poll();
-  loadSessions();
-}
-
-async function poll() {
-  if (viewingId) return;  // 지난 세션을 보는 중이면 실시간 갱신 안 함
-  try {
-    const r = await fetch('/state.json');
-    const data = await r.json();
-    document.getElementById('feed').innerHTML = data.feed_html;
-    document.getElementById('status').textContent = data.status;
-    document.getElementById('conn').innerHTML = data.conn_html +
-      '<button class="secondary" onclick="recheck()" style="padding:4px 10px;font-size:12px">다시 확인</button>';
-    if (data.topic) {
-      document.getElementById('topicSection').innerHTML =
-        '<div class="topic">📌 ' + data.topic + ' <span style="opacity:.6">· ' + data.mode_label + '</span></div>';
-    }
-    const hasTopic = !!data.topic;
-    document.getElementById('pauseBtn').disabled = !hasTopic || data.finished || data.stopped || data.paused;
-    document.getElementById('resumeBtn').disabled = !hasTopic || data.finished || data.stopped || !data.paused;
-    document.getElementById('stopBtn').disabled = !hasTopic || data.finished || data.stopped;
-    document.getElementById('approveBanner').style.display =
-      (data.awaiting_approval && !data.stopped) ? 'block' : 'none';
-  } catch (e) {}
-}
-async function approveWork() {
-  await fetch('/approve', {method:'POST'});
-  poll();
-}
-async function submitTopic() {
-  const ta = document.getElementById('topicInput');
-  const topic = ta.value.trim();
-  if (!topic) return;
-  const modeEl = document.querySelector('input[name="mode"]:checked');
-  const mode = modeEl ? modeEl.value : 'discussion';
-  await fetch('/topic', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:'topic=' + encodeURIComponent(topic) + '&mode=' + encodeURIComponent(mode)});
-  location.reload();
-}
-async function recheck() {
-  document.getElementById('conn').innerHTML = '<span class="conn-item">⏳ 확인 중...</span>';
-  await fetch('/preflight', {method:'POST'});
-  poll();
-}
-async function ctrl(action) {
-  await fetch('/' + action, {method:'POST'});
-  poll();
-}
-async function stopSession() {
-  if (!confirm('중단할까요? 현재 진행 중인 턴이 끝나면 멈춥니다.')) return;
-  await fetch('/stop', {method:'POST'});
-  poll();
-}
-async function restartSession() {
-  if (!confirm('현재 세션 기록을 지우고 새로 시작할까요?')) return;
-  await fetch('/restart', {method:'POST'});
-  location.reload();
-}
-async function sendMessage() {
-  const ta = document.getElementById('msgText');
-  const text = ta.value.trim();
-  if (!text) return;
-  await fetch('/message', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'text=' + encodeURIComponent(text)});
-  ta.value = '';
-  poll();
-}
-setInterval(poll, 2000);
-setInterval(loadSessions, 4000);
-poll();
-loadSessions();
-</script>
+<script src="/static/dashboard.js"></script>
 </body>
 </html>

@@ -62,11 +62,66 @@ STATE_PATH = ROOT / "roundtable_state.json"
 HTML_PATH = ROOT / "roundtable.html"
 LOG_PATH = ROOT / "roundtable_log.md"
 SESSIONS_DIR = ROOT / "sessions"
+MEMORY_DIR = ROOT / "roundtable_memory"
 TEAM_PROMPT_PATH = ROOT / "TEAM_PROMPT.md"
 PROFILE_PATHS = {
     "codex": ROOT / "CODEX_Profile.md",
     "antigravity": ROOT / "ANTIGRAVITY_Profile.md",
     "claude": ROOT / "CLAUDE_Profile.md",
+}
+
+SESSION_PROFILE_TEMPLATE = """# Session Role Profile
+
+이 파일은 이 채팅 세션의 역할/강점/분담을 관리하는 프로필이다.
+매 세션은 이 기본값에서 시작하고, 에이전트들이 토의한 뒤 나온 역할 선언과 조율 내용을 여기에 누적한다.
+
+## 운영 규칙
+- 각 에이전트는 이 세션에서 맡은 역할과 책임 범위를 우선 따른다.
+- 역할이 충돌하면 대화에서 조율하고, 조율 결과를 다음 응답에 명확히 남긴다.
+- 이 프로필은 세션별 기록이다. 다른 세션의 역할 분담과 섞지 않는다.
+
+## 현재 역할
+- Codex: 미정
+- Antigravity: 미정
+- Claude Code: 미정
+
+## 변경 기록
+"""
+
+AGENT_PROFILE_TEMPLATES = {
+    "codex": """# Codex Profile
+
+## 기본 성향
+- 코드 구조, 백엔드 로직, 상태 관리, 실행 검증을 우선적으로 점검한다.
+- 다른 에이전트와 역할이 겹치면 구현 책임과 검증 책임을 분리한다.
+
+## 이번 세션 역할
+- 미정
+
+## 세션 기록
+""",
+    "antigravity": """# Antigravity Profile
+
+## 기본 성향
+- UI 흐름, 프론트엔드 구조, 상호작용, 사용자 경험을 우선적으로 점검한다.
+- 시각적 개선을 제안할 때 실제 구현 파일과 사용자 동선을 함께 본다.
+
+## 이번 세션 역할
+- 미정
+
+## 세션 기록
+""",
+    "claude": """# Claude Code Profile
+
+## 기본 성향
+- 기획 정리, 역할 조율, 최종 보고, 사용자 실행 관점의 결론을 우선적으로 점검한다.
+- 의견이 갈리면 결론과 다음 행동을 명확히 정리한다.
+
+## 이번 세션 역할
+- 미정
+
+## 세션 기록
+""",
 }
 
 DEFAULT_TEAM_PROMPT = """# 공통 지침 (Codex / Antigravity / Claude Code 공용)
@@ -151,12 +206,16 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "900"))
 AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
 PORT = int(os.environ.get("ROUNDTABLE_PORT", "8765"))
+# 프롬프트에 매번 재전송할 최근 대화 개수 — 전체 기록은 roundtable_memory/<id>/full.md에
+# 남기고, 프롬프트에는 요약 + 최근 메시지만 넣어 토큰 낭비를 줄인다.
+TRANSCRIPT_WINDOW = int(os.environ.get("ROUNDTABLE_TRANSCRIPT_WINDOW", "3"))
+MEMORY_BRIEF_LINES = int(os.environ.get("ROUNDTABLE_MEMORY_BRIEF_LINES", "18"))
 
 AGENTS = {
-    "codex": {"label": "Codex", "color": "#5b8def", "side": "left"},
-    "antigravity": {"label": "Antigravity", "color": "#c77dff", "side": "center"},
-    "claude": {"label": "Claude Code", "color": "#d97757", "side": "right"},
-    "user": {"label": "나 (개입)", "color": "#4caf50", "side": "center"},
+    "codex": {"label": "Codex", "color": "#4f8cff", "side": "left", "avatar": "/static/agents/codex.svg"},
+    "antigravity": {"label": "Antigravity", "color": "#a66cff", "side": "center", "avatar": "/static/agents/antigravity.svg"},
+    "claude": {"label": "Claude Code", "color": "#ff8a3d", "side": "right", "avatar": "/static/agents/claude.svg"},
+    "user": {"label": "나 (개입)", "color": "#42c991", "side": "center", "avatar": "/static/agents/user.svg"},
 }
 
 ROLES = "백엔드(로직/API/데이터), 프론트엔드(UI/사용자 경험), 기획·아이디어 정리(설계/전체 조율)"
@@ -252,10 +311,58 @@ CODING_REPORT_STEP = (
 )
 
 
-def steps_for_mode(mode: str) -> list[tuple[str, str, str, str]]:
+AGENT_ORDER = ["codex", "antigravity", "claude"]
+
+
+def normalize_enabled_agents(enabled_agents: list[str] | None) -> list[str]:
+    enabled = [a for a in (enabled_agents or AGENT_ORDER) if a in AGENT_ORDER]
+    return enabled or list(AGENT_ORDER)
+
+
+def reporter_for(enabled_agents: list[str]) -> str:
+    enabled = normalize_enabled_agents(enabled_agents)
+    for candidate in ("claude", "antigravity", "codex"):
+        if candidate in enabled:
+            return candidate
+    return "claude"
+
+
+def make_report_step(enabled_agents: list[str], coding: bool = False) -> tuple[str, str, str, str]:
+    reporter = reporter_for(enabled_agents)
+    if coding:
+        instruction = (
+            "지금까지 활성화된 에이전트들이 실제로 반영한 코드 변경사항을 정리해서, "
+            "팀장(사용자)에게 무엇이 어떻게 바뀌었는지, 비활성화된 에이전트가 누구였는지, "
+            "다음에 뭘 하면 좋을지 실행 가능한 결론으로 요약해줘."
+        )
+    else:
+        instruction = (
+            "지금까지 활성화된 에이전트들이 나눈 강점 이야기와 역할 선언을 정리해서, "
+            "팀장(사용자)에게 바로 보고해. 누가 어떤 역할을 맡았는지, 비활성화된 "
+            "에이전트가 누구였는지, 그리고 다음에 무엇부터 시작하면 좋을지 3~6문장으로 요약해줘."
+        )
+    return (reporter, "최종 보고", instruction, "discussion")
+
+
+def make_confirm_step(enabled_agents: list[str]) -> tuple[str, str, str, str]:
+    reporter = reporter_for(enabled_agents)
+    return (
+        reporter, CONFIRM_PHASE,
+        "지금까지 활성화된 에이전트들의 제안을 참고해서, 각자의 개선/수정 계획 전체를 "
+        "하나로 정리하고 팀장(사용자)에게 실제로 진행해도 될지 확인을 요청하는 메시지를 "
+        "작성해. 비활성화된 에이전트가 누구인지도 명시해. 아직 실제로 파일을 수정하지 마.",
+        "discussion",
+    )
+
+
+def steps_for_mode(mode: str, enabled_agents: list[str] | None = None) -> list[tuple[str, str, str, str]]:
+    enabled = normalize_enabled_agents(enabled_agents)
+    discussion_steps = [step for step in DISCUSSION_STEPS if step[0] in enabled]
     if mode == "coding":
-        return DISCUSSION_STEPS + PROPOSAL_STEPS + CODING_WORK_STEPS + [CODING_REPORT_STEP]
-    return DISCUSSION_STEPS + [REPORT_STEP]
+        proposal_steps = [step for step in PROPOSAL_STEPS if step[0] in enabled and step[1] != CONFIRM_PHASE]
+        coding_steps = [step for step in CODING_WORK_STEPS if step[0] in enabled]
+        return discussion_steps + proposal_steps + [make_confirm_step(enabled)] + coding_steps + [make_report_step(enabled, coding=True)]
+    return discussion_steps + [make_report_step(enabled)]
 
 
 # ──────────────────────────────────────────
@@ -457,17 +564,42 @@ def new_state() -> dict:
         "finished": False,
         "topic": "",
         "mode": "discussion",
+        "enabled_agents": list(AGENT_ORDER),
+        "total_est_tokens": 0,
+        "total_elapsed_time": 0.0,
+        "active_agent": None,
+        "active_phase": None,
+        "active_started_at": None,
+        "active_cli_mode": None,
+        "active_prompt_chars": 0,
+        "runtime_events": [],
     }
+
+
+def normalize_state(state: dict) -> dict:
+    state.setdefault("id", new_session_id())
+    state.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+    state.setdefault("messages", [])
+    state.setdefault("step_index", 0)
+    state.setdefault("finished", False)
+    state.setdefault("topic", "")
+    state.setdefault("mode", "discussion")
+    state.setdefault("total_est_tokens", 0)
+    state.setdefault("total_elapsed_time", 0.0)
+    state.setdefault("active_agent", None)
+    state.setdefault("active_phase", None)
+    state.setdefault("active_started_at", None)
+    state.setdefault("active_cli_mode", None)
+    state.setdefault("active_prompt_chars", 0)
+    state.setdefault("runtime_events", [])
+    state["enabled_agents"] = normalize_enabled_agents(state.get("enabled_agents"))
+    return state
 
 
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
-            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            if "id" not in state:
-                state["id"] = new_session_id()
-                state["created_at"] = datetime.now().isoformat(timespec="seconds")
-            return state
+            return normalize_state(json.loads(STATE_PATH.read_text(encoding="utf-8")))
         except json.JSONDecodeError:
             pass
     return new_state()
@@ -495,6 +627,7 @@ def list_sessions() -> list[dict]:
             "id": data.get("id", path.stem),
             "topic": data.get("topic", ""),
             "mode": data.get("mode", "discussion"),
+            "enabled_agents": normalize_enabled_agents(data.get("enabled_agents")),
             "finished": data.get("finished", False),
             "created_at": data.get("created_at", ""),
             "message_count": len(data.get("messages", [])),
@@ -525,6 +658,143 @@ def start_log_session() -> None:
         f.write(header)
 
 
+def session_transcript_path(session_id: str) -> Path:
+    return SESSIONS_DIR / f"{session_id}.md"
+
+
+def session_memory_dir(session_id: str) -> Path:
+    return MEMORY_DIR / session_id
+
+
+def session_memory_paths(session_id: str) -> tuple[Path, Path]:
+    memory_dir = session_memory_dir(session_id)
+    return memory_dir / "full.md", memory_dir / "brief.md"
+
+
+def session_profile_path(session_id: str) -> Path:
+    return session_memory_dir(session_id) / "Profile.md"
+
+
+def session_agent_profile_dir(session_id: str) -> Path:
+    return session_memory_dir(session_id) / "profiles"
+
+
+def session_agent_profile_path(session_id: str, agent: str) -> Path:
+    filename = f"{agent.upper()}_Profile.md"
+    return session_agent_profile_dir(session_id) / filename
+
+
+def agent_names(agent_keys: list[str]) -> str:
+    return ", ".join(AGENTS[a]["label"] for a in agent_keys)
+
+
+def write_session_transcript_header(state: dict) -> None:
+    """세션별 전체 기록 .md — 매 턴 프롬프트에 재전송하는 대신 여기 따로 보관한다."""
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    path = session_transcript_path(state["id"])
+    if path.exists():
+        return
+    mode_label = MODE_LABELS.get(state.get("mode", "discussion"), state.get("mode", ""))
+    path.write_text(
+        f"# 세션 기록 — {state.get('topic', '')}\n\n"
+        f"- 세션 ID: {state['id']}\n"
+        f"- 모드: {mode_label}\n"
+        f"- 시작: {state.get('created_at', '')}\n",
+        encoding="utf-8",
+    )
+
+
+def ensure_session_memory(state: dict) -> None:
+    session_id = state["id"]
+    memory_dir = session_memory_dir(session_id)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    full_path, brief_path = session_memory_paths(session_id)
+    profile_dir = session_agent_profile_dir(session_id)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    mode_label = MODE_LABELS.get(state.get("mode", "discussion"), state.get("mode", ""))
+    enabled = normalize_enabled_agents(state.get("enabled_agents"))
+    disabled = [a for a in AGENT_ORDER if a not in enabled]
+    header = (
+        f"# Roundtable Memory — {state.get('topic', '')}\n\n"
+        f"- 세션 ID: {session_id}\n"
+        f"- 모드: {mode_label}\n"
+        f"- 활성 에이전트: {agent_names(enabled)}\n"
+        f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}\n"
+        f"- 시작: {state.get('created_at', '')}\n"
+    )
+    if not full_path.exists():
+        full_path.write_text(header, encoding="utf-8")
+    if not brief_path.exists():
+        brief_path.write_text(header + "\n## 압축 요약\n", encoding="utf-8")
+    profile_path = session_profile_path(session_id)
+    if not profile_path.exists():
+        profile_path.write_text(SESSION_PROFILE_TEMPLATE, encoding="utf-8")
+    for agent in AGENT_ORDER:
+        path = session_agent_profile_path(session_id, agent)
+        if not path.exists():
+            path.write_text(AGENT_PROFILE_TEMPLATES[agent], encoding="utf-8")
+
+
+def append_memory(session_id: str, agent: str, phase: str, text: str, meta: dict | None = None) -> None:
+    with STATE_LOCK:
+        state_snapshot = dict(STATE)
+    ensure_session_memory(state_snapshot)
+    full_path, brief_path = session_memory_paths(session_id)
+    label = AGENTS[agent]["label"]
+    stats = ""
+    if meta:
+        stats = f" _(⏱ {meta['elapsed']}초 · 추정 토큰 ~{meta['est_tokens']} · {meta['cli_mode']})_"
+    with full_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n## [{ts()}] {label} — {phase}{stats}\n\n{text}\n")
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) > 360:
+        compact = compact[:357] + "..."
+    with brief_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n- [{ts()}] **{label} / {phase}**: {compact}\n")
+
+
+def should_record_role_profile(phase: str) -> bool:
+    role_keywords = ("강점", "역할", "확인 요청", "개선안", "최종 보고", "개입 답변")
+    return any(keyword in phase for keyword in role_keywords)
+
+
+def append_session_role_profile(session_id: str, agent: str, phase: str, text: str) -> None:
+    if agent not in AGENT_ORDER or not should_record_role_profile(phase):
+        return
+    with STATE_LOCK:
+        state_snapshot = dict(STATE)
+    ensure_session_memory(state_snapshot)
+    label = AGENTS[agent]["label"]
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) > 900:
+        compact = compact[:897] + "..."
+    entry = f"\n### [{ts()}] {label} — {phase}\n\n{compact}\n"
+    with session_profile_path(session_id).open("a", encoding="utf-8") as f:
+        f.write(entry)
+    with session_agent_profile_path(session_id, agent).open("a", encoding="utf-8") as f:
+        f.write(entry)
+
+
+def read_profile_tail(path: Path, max_lines: int = 28) -> str:
+    if not path.exists():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def append_session_transcript(session_id: str, agent: str, phase: str, text: str, meta: dict | None = None) -> None:
+    label = AGENTS[agent]["label"]
+    stats = ""
+    if meta:
+        stats = f" _(⏱ {meta['elapsed']}초 · 추정 토큰 ~{meta['est_tokens']} · {meta['cli_mode']})_"
+    path = session_transcript_path(session_id)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"\n## [{ts()}] {label} — {phase}{stats}\n\n{text}\n")
+
+
 def update_profile(agent: str, messages: list[dict]) -> None:
     path = PROFILE_PATHS.get(agent)
     if path is None:
@@ -542,14 +812,69 @@ def update_profile(agent: str, messages: list[dict]) -> None:
         f.write("".join(lines))
 
 
-def build_transcript(messages: list[dict]) -> str:
+def build_transcript(messages: list[dict], window: int | None = None) -> str:
+    """
+    프롬프트에 실어 보낼 최근 대화 기록을 만든다. 전체 기록은 memory full.md에 저장하고,
+    여기서는 최근 window개만 넣는다.
+    """
     if not messages:
         return ""
+    windowed = messages[-window:] if window else messages
+    omitted = len(messages) - len(windowed)
     lines = []
-    for m in messages:
+    if omitted > 0:
+        lines.append(f"(이전 {omitted}개 메시지는 생략됨 — 최근 {len(windowed)}개만 표시)")
+    for m in windowed:
         label = AGENTS[m["agent"]]["label"]
         lines.append(f"[{label}] ({m['phase']}): {m['text']}")
     return "\n\n".join(lines)
+
+
+def read_brief_tail(session_id: str, max_lines: int = MEMORY_BRIEF_LINES) -> str:
+    _full_path, brief_path = session_memory_paths(session_id)
+    if not brief_path.exists():
+        return ""
+    try:
+        lines = brief_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    bullet_lines = [line for line in lines if line.startswith("- [")]
+    return "\n".join(bullet_lines[-max_lines:])
+
+
+def build_memory_context(state: dict) -> str:
+    session_id = state.get("id", "")
+    if not session_id:
+        return ""
+    ensure_session_memory(state)
+    full_path, brief_path = session_memory_paths(session_id)
+    profile_path = session_profile_path(session_id)
+    enabled = normalize_enabled_agents(state.get("enabled_agents"))
+    disabled = [a for a in AGENT_ORDER if a not in enabled]
+    brief_tail = read_brief_tail(session_id)
+    profile_tail = read_profile_tail(profile_path)
+    lines = [
+        "공유 메모리:",
+        f"- 전체 기록 파일: {full_path}",
+        f"- 압축 요약 파일: {brief_path}",
+        f"- 세션 역할 프로필: {profile_path}",
+        "- 모델별 프로필:",
+        *[f"  - {AGENTS[a]['label']}: {session_agent_profile_path(session_id, a)}" for a in enabled],
+        f"- 활성 에이전트: {agent_names(enabled)}",
+        f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}",
+        "",
+        "규칙:",
+        "- 전체 채팅을 프롬프트에 반복해서 붙이지 않는다.",
+        "- 필요한 경우 위 전체 기록 파일을 직접 열어 확인한다.",
+        "- 역할/강점/분담은 세션 역할 프로필을 skill처럼 읽고 따른다.",
+        "- 역할이 바뀌면 응답에 명확히 남겨라. 시스템이 이 세션 프로필에 기록한다.",
+        "- 비활성 에이전트는 이번 세션에서 발언/작업하지 않는다는 점을 고려한다.",
+    ]
+    if profile_tail:
+        lines.extend(["", "최근 세션 역할 프로필:", profile_tail])
+    if brief_tail:
+        lines.extend(["", "최근 압축 요약:", brief_tail])
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────
@@ -558,7 +883,32 @@ def build_transcript(messages: list[dict]) -> str:
 
 STATE_LOCK = threading.Lock()
 STATE: dict = load_state()
-CONTROL = {"paused": False, "stopped": False, "worker_running": False, "awaiting_approval": False}
+CONTROL = {
+    "paused": False,
+    "stopped": False,
+    "worker_running": False,
+    "awaiting_approval": False,
+    "approval_deferred": False,
+    "approval_seen_messages": 0,
+    "intervention_pending": False,
+    "intervention_seen_messages": 0,
+    "intervention_intent": "",
+    "intervention_queue": [],
+}
+
+
+def add_runtime_event(text: str, level: str = "info") -> None:
+    event = {
+        "time": ts(),
+        "level": level,
+        "text": text,
+    }
+    print(f"  [{event['time']}] {text}")
+    with STATE_LOCK:
+        events = STATE.setdefault("runtime_events", [])
+        events.append(event)
+        del events[:-80]
+        save_state(STATE)
 
 
 # ──────────────────────────────────────────
@@ -646,7 +996,12 @@ def bubble_html(m: dict) -> str:
     return f"""
     <div class="row {side}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
-        <div class="meta"><span class="name">{html.escape(agent['label'])}</span><span class="phase">{html.escape(m.get('phase', ''))}</span><span class="time">{html.escape(m['time'])}</span></div>
+        <div class="meta">
+          <img class="avatar" src="{html.escape(agent.get('avatar', ''))}" alt="">
+          <span class="name">{html.escape(agent['label'])}</span>
+          <span class="phase">{html.escape(m.get('phase', ''))}</span>
+          <span class="time">{html.escape(m['time'])}</span>
+        </div>
         <div class="text">{render_text_html(m['text'])}</div>
         {stats_html}
       </div>
@@ -654,11 +1009,20 @@ def bubble_html(m: dict) -> str:
 
 
 def status_text() -> str:
+    active_agent = STATE.get("active_agent")
+    if active_agent:
+        label = AGENTS.get(active_agent, {}).get("label", active_agent)
+        phase = STATE.get("active_phase") or "생각 중"
+        return f"{label} · {phase} 중"
+    if CONTROL["intervention_pending"]:
+        return "사용자 개입 처리 대기 중"
     if STATE.get("finished"):
         return "완료"
     if CONTROL["stopped"]:
         return "중단됨"
     if CONTROL["awaiting_approval"]:
+        if CONTROL["approval_deferred"]:
+            return "\U0001f6d1 승인 보류 중 — 질문/수정 요청 가능"
         return "\U0001f6d1 사용자 승인 대기 중"
     if CONTROL["paused"]:
         return "일시정지"
@@ -675,10 +1039,115 @@ def add_message(agent: str, phase: str, text: str, meta: dict | None = None) -> 
         message = {"agent": agent, "phase": phase, "time": ts(), "text": text}
         if meta:
             message["meta"] = meta
+            STATE["total_est_tokens"] = STATE.get("total_est_tokens", 0) + meta.get("est_tokens", 0)
+            STATE["total_elapsed_time"] = STATE.get("total_elapsed_time", 0.0) + meta.get("elapsed", 0.0)
         STATE["messages"].append(message)
         save_state(STATE)
+        session_id = STATE["id"]
     append_log(agent, phase, text)
+    append_session_transcript(session_id, agent, phase, text, meta)
+    append_memory(session_id, agent, phase, text, meta)
+    append_session_role_profile(session_id, agent, phase, text)
     render_html_snapshot()
+
+
+INTERVENTION_INTENTS = {
+    "question": {
+        "label": "질문",
+        "phase": "사용자 개입 · 질문",
+        "instruction": (
+            "팀장(사용자)이 진행 중인 대화에 질문으로 개입했다. 최근 대화와 공유 메모리를 "
+            "확인해서 질문에 먼저 답하고, 기존 진행 계획에 영향이 있는지 짧게 정리해라. "
+            "아직 실제로 파일을 수정하지 마."
+        ),
+        "pause_after": False,
+    },
+    "redirect": {
+        "label": "방향 수정",
+        "phase": "사용자 개입 · 방향 수정",
+        "instruction": (
+            "팀장(사용자)이 진행 방향을 수정했다. 이 지시를 기존 계획보다 우선해서 반영하고, "
+            "앞으로 어떤 단계/역할/작업이 달라지는지 정리해라. 아직 실제로 파일을 수정하지 마."
+        ),
+        "pause_after": False,
+    },
+    "hold": {
+        "label": "멈추고 답변",
+        "phase": "사용자 개입 · 멈추고 답변",
+        "instruction": (
+            "팀장(사용자)이 진행을 잠시 멈추고 답변을 요구했다. 질문이나 우려에 답하고, "
+            "계속 진행하려면 무엇을 승인하거나 수정해야 하는지 명확히 정리해라. 아직 실제로 파일을 수정하지 마."
+        ),
+        "pause_after": True,
+    },
+    "note": {
+        "label": "참고",
+        "phase": "사용자 메모",
+        "instruction": "",
+        "pause_after": False,
+    },
+}
+
+
+def intervention_responder() -> str:
+    with STATE_LOCK:
+        enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+        active = STATE.get("active_agent")
+    if active in enabled:
+        return active
+    return reporter_for(enabled)
+
+
+def normalize_target_agents(targets: list[str] | None) -> list[str]:
+    normalized = [agent for agent in (targets or []) if agent in AGENT_ORDER]
+    if normalized:
+        return normalized
+    with STATE_LOCK:
+        enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+    return enabled
+
+
+def mark_intervention(intent: str, targets: list[str] | None = None) -> None:
+    intent = intent if intent in INTERVENTION_INTENTS else "question"
+    if intent == "note":
+        return
+    target_agents = normalize_target_agents(targets)
+    with STATE_LOCK:
+        CONTROL["intervention_pending"] = True
+        CONTROL["intervention_intent"] = intent
+        CONTROL["intervention_seen_messages"] = len(STATE["messages"])
+        CONTROL["intervention_queue"].append({
+            "intent": intent,
+            "targets": target_agents,
+        })
+
+
+def process_pending_intervention() -> bool:
+    if not CONTROL["intervention_pending"]:
+        return False
+    with STATE_LOCK:
+        item = CONTROL["intervention_queue"].pop(0) if CONTROL["intervention_queue"] else None
+        CONTROL["intervention_pending"] = bool(CONTROL["intervention_queue"])
+        CONTROL["intervention_intent"] = CONTROL["intervention_queue"][0]["intent"] if CONTROL["intervention_queue"] else ""
+    if not item:
+        return False
+    intent = item["intent"] if item["intent"] in INTERVENTION_INTENTS else "question"
+    spec = INTERVENTION_INTENTS[intent]
+    targets = normalize_target_agents(item.get("targets"))
+    add_runtime_event(f"사용자 개입 처리 시작: {spec['label']} → {agent_names(targets)}")
+    for responder in targets:
+        target_instruction = (
+            f"{spec['instruction']}\n\n"
+            f"이번 개입의 직접 대상 모델: {agent_names(targets)}.\n"
+            f"너({AGENTS[responder]['label']})에게 직접 질문/지시가 왔다고 보고 답해라."
+        )
+        run_step(responder, "개입 답변", target_instruction, "discussion")
+    with STATE_LOCK:
+        CONTROL["intervention_seen_messages"] = len(STATE["messages"])
+    if spec["pause_after"]:
+        CONTROL["paused"] = True
+        separator("사용자 개입 처리 완료 — 재개 버튼을 누르면 이어서 진행됩니다")
+    return True
 
 
 # ──────────────────────────────────────────
@@ -689,13 +1158,34 @@ def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
     label = AGENTS[agent]["label"]
     separator(f"{label} — {phase}")
     with STATE_LOCK:
+        state_snapshot = dict(STATE)
         topic = STATE.get("topic", "").strip()
-        transcript = build_transcript(STATE["messages"])
+        transcript = build_transcript(STATE["messages"], window=TRANSCRIPT_WINDOW)
+    memory_context = build_memory_context(state_snapshot)
     team_prompt = load_team_prompt()
     topic_line = f"오늘 다룰 주제/프로젝트: {topic}\n\n" if topic else ""
-    body = f"지금까지의 대화 기록:\n\n{transcript}\n\n---\n\n{instruction}" if transcript else instruction
-    prompt = f"{team_prompt}\n\n---\n\n{topic_line}{body}"
+    if transcript:
+        body = f"{memory_context}\n\n최근 대화 기록:\n\n{transcript}\n\n---\n\n{instruction}"
+    else:
+        body = f"{memory_context}\n\n---\n\n{instruction}" if memory_context else instruction
+    prompt = (
+        "아래 공통 지침은 완전한 전문이다. 사용자에게 공통 지침을 이어서 보내 달라고 "
+        "요청하지 말고, 이 지침과 이어지는 작업 지시만 기준으로 바로 응답해라.\n"
+        "중요: 사용자에게 보이는 모든 출력은 반드시 한국어로 작성해라. CLI 내부 계획, 도구 실행 계획, "
+        "작업 설명, 최종 요약도 영어로 쓰지 마라. 파일명/명령어/코드 식별자만 원문을 유지해도 된다.\n"
+        "Important: respond to the user in Korean only. Do not write visible planning text in English.\n\n"
+        f"{team_prompt}\n\n---\n\n{topic_line}{body}"
+    )
 
+    with STATE_LOCK:
+        STATE["active_agent"] = agent
+        STATE["active_phase"] = phase
+        STATE["active_started_at"] = time.time()
+        STATE["active_cli_mode"] = cli_mode
+        STATE["active_prompt_chars"] = len(prompt)
+        save_state(STATE)
+    add_runtime_event(f"{label} — {phase} 시작 (cli_mode={cli_mode}, 입력 {len(prompt)}자)")
+    render_html_snapshot()
     print(f"\U0001f914 {label} 생각 중... (입력 약 {len(prompt)}자, cli_mode={cli_mode})")
     t0 = time.time()
     text = ASK_FUNCS[agent](prompt, cli_mode)
@@ -711,25 +1201,39 @@ def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
         "prompt_chars": len(prompt),
         "output_chars": len(text),
     }
+    with STATE_LOCK:
+        STATE["active_agent"] = None
+        STATE["active_phase"] = None
+        STATE["active_started_at"] = None
+        STATE["active_cli_mode"] = None
+        STATE["active_prompt_chars"] = 0
+        save_state(STATE)
+    add_runtime_event(f"{label} — {phase} 완료 ({elapsed:.1f}초, 추정 토큰 ~{est_tokens})")
     add_message(agent, phase, text, meta)
 
 
 def worker_loop() -> None:
-    with STATE_LOCK:
-        mode = STATE.get("mode", "discussion")
-    steps = steps_for_mode(mode)
     try:
         while True:
             with STATE_LOCK:
+                mode = STATE.get("mode", "discussion")
+                enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+                steps = steps_for_mode(mode, enabled_agents)
                 step_index = STATE["step_index"]
+            if process_pending_intervention():
+                continue
             if step_index >= len(steps):
                 break
             if CONTROL["stopped"]:
                 break
             while CONTROL["paused"] and not CONTROL["stopped"]:
+                if process_pending_intervention():
+                    continue
                 time.sleep(0.3)
             if CONTROL["stopped"]:
                 break
+            if process_pending_intervention():
+                continue
 
             agent, phase, instruction, cli_mode = steps[step_index]
             run_step(agent, phase, instruction, cli_mode)
@@ -740,11 +1244,28 @@ def worker_loop() -> None:
 
             if phase == CONFIRM_PHASE and not CONTROL["stopped"]:
                 CONTROL["awaiting_approval"] = True
+                CONTROL["approval_deferred"] = False
+                with STATE_LOCK:
+                    CONTROL["approval_seen_messages"] = len(STATE["messages"])
                 separator("사용자 승인 대기 중 — 대시보드에서 승인해야 코딩이 진행됩니다")
                 while CONTROL["awaiting_approval"] and not CONTROL["stopped"]:
+                    with STATE_LOCK:
+                        message_count = len(STATE["messages"])
+                        last_message = STATE["messages"][-1] if STATE["messages"] else None
+                    if message_count > CONTROL["approval_seen_messages"]:
+                        CONTROL["approval_seen_messages"] = message_count
+                        if last_message and last_message.get("agent") == "user":
+                            CONTROL["approval_deferred"] = True
+                            process_pending_intervention()
+                            with STATE_LOCK:
+                                CONTROL["approval_seen_messages"] = len(STATE["messages"])
+                            separator("사용자 승인 대기 중 — 답변을 검토하고 승인/보류를 선택하세요")
                     time.sleep(0.3)
     finally:
         with STATE_LOCK:
+            mode = STATE.get("mode", "discussion")
+            enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+            steps = steps_for_mode(mode, enabled_agents)
             finished = STATE["step_index"] >= len(steps) and not CONTROL["stopped"]
             STATE["finished"] = finished
             save_state(STATE)
@@ -757,11 +1278,14 @@ def worker_loop() -> None:
         separator("워커 종료" if not finished else "완료")
 
 
-def start_worker_if_needed() -> None:
+def start_worker_if_needed(force: bool = False) -> None:
     if CONTROL["worker_running"]:
         return
     CONTROL["worker_running"] = True
-    CONTROL["stopped"] = False
+    if force:
+        CONTROL["stopped"] = False
+    else:
+        CONTROL["stopped"] = False
     thread = threading.Thread(target=worker_loop, daemon=True)
     thread.start()
 
@@ -798,42 +1322,56 @@ def connection_status_html() -> str:
 MODE_LABELS = {"discussion": "일반 토론 모드", "coding": "코딩 모드"}
 
 
-def render_dashboard() -> str:
-    with STATE_LOCK:
-        messages = list(STATE["messages"])
-        topic = STATE.get("topic", "").strip()
-        finished = STATE.get("finished", False)
-        mode = STATE.get("mode", "discussion")
-    bubbles = "".join(bubble_html(m) for m in messages) if messages else \
-        '<p style="text-align:center;color:#6a6f7c">아직 대화가 없습니다.</p>'
-    paused = CONTROL["paused"]
-    stopped = CONTROL["stopped"]
-
+def topic_section_html(topic: str, mode: str, enabled_agents: list[str], active_id: str) -> str:
     project_path_line = (
-        f'<p style="margin:6px 0 0;font-size:12px;color:#7a7f8c">코딩 모드 작업 경로: '
+        f'<p>코딩 모드 작업 경로: '
         f'{html.escape(str(load_project_path()))} '
         f'(<code>{html.escape(PROJECT_PATH_FILE.name)}</code>에서 변경)</p>'
     )
 
     if topic:
         mode_label = MODE_LABELS.get(mode, mode)
-        topic_section = (
-            f'<div class="topic">\U0001f4cc {html.escape(topic)} '
-            f'<span style="opacity:.6">· {html.escape(mode_label)}</span>'
+        disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
+        return (
+            f'<div class="topic"><h3>{html.escape(topic)} '
+            f'<span style="color:var(--faint);font-weight:500">· {html.escape(mode_label)}</span></h3>'
+            f'<p>활성: {html.escape(agent_names(enabled_agents))} · 비활성: '
+            f'{html.escape(agent_names(disabled_agents) if disabled_agents else "없음")}</p>'
+            f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
             f'{project_path_line if mode == "coding" else ""}</div>'
         )
-    else:
-        topic_section = f"""
+
+    return f"""
       <div class="panel">
-        <p style="margin:0;font-size:13.5px;color:#c7cad3">토론 주제를 입력하면 바로 시작합니다.</p>
+        <p style="margin:0;color:var(--muted);font-size:13px">토론 주제를 입력하면 바로 시작합니다.</p>
         <textarea id="topicInput" placeholder="예: 네이버 쇼핑 최저가 비교 웹앱을 같이 만들 거야" autofocus></textarea>
         <div class="mode-choice">
           <label><input type="radio" name="mode" value="discussion" checked> 일반 토론 모드 (읽기 전용, 강점/역할 논의)</label>
           <label><input type="radio" name="mode" value="coding"> 코딩 모드 (실제로 이 폴더 코드를 수정)</label>
         </div>
+        <div class="agent-choice">
+          <label><input type="checkbox" name="agent" value="codex" checked> Codex</label>
+          <label><input type="checkbox" name="agent" value="antigravity" checked> Antigravity</label>
+          <label><input type="checkbox" name="agent" value="claude" checked> Claude Code</label>
+        </div>
         {project_path_line}
         <button onclick="submitTopic()">시작</button>
       </div>"""
+
+
+def render_dashboard() -> str:
+    with STATE_LOCK:
+        messages = list(STATE["messages"])
+        topic = STATE.get("topic", "").strip()
+        finished = STATE.get("finished", False)
+        mode = STATE.get("mode", "discussion")
+        enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+        active_id = STATE.get("id", "")
+    bubbles = "".join(bubble_html(m) for m in messages) if messages else \
+        '<div class="empty-state">아직 대화가 없습니다.</div>'
+    paused = CONTROL["paused"]
+    stopped = CONTROL["stopped"]
+    topic_section = topic_section_html(topic, mode, enabled_agents, active_id)
 
     no_topic = "disabled" if not topic else ""
     pause_disabled = "disabled" if (not topic or finished or stopped or paused) else ""
@@ -863,19 +1401,49 @@ def state_json_payload() -> dict:
         topic = STATE.get("topic", "").strip()
         mode = STATE.get("mode", "discussion")
         active_id = STATE.get("id", "")
+        enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+        total_est_tokens = STATE.get("total_est_tokens", 0)
+        total_elapsed_time = STATE.get("total_elapsed_time", 0.0)
+        active_agent = STATE.get("active_agent")
+        active_phase = STATE.get("active_phase")
+        active_started_at = STATE.get("active_started_at")
+        active_cli_mode = STATE.get("active_cli_mode")
+        active_prompt_chars = STATE.get("active_prompt_chars", 0)
+        runtime_events = list(STATE.get("runtime_events", []))[-20:]
+    active_elapsed = round(time.time() - active_started_at, 1) if active_started_at else 0.0
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
-        '<p style="text-align:center;color:#6a6f7c">아직 대화가 없습니다.</p>'
+        '<div class="empty-state">아직 대화가 없습니다.</div>'
+    disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     return {
         "feed_html": bubbles,
+        "topic_section_html": topic_section_html(topic, mode, enabled_agents, active_id),
         "status": status_text(),
         "finished": finished,
         "paused": CONTROL["paused"],
         "stopped": CONTROL["stopped"],
         "awaiting_approval": CONTROL["awaiting_approval"],
+        "approval_deferred": CONTROL["approval_deferred"],
+        "intervention_pending": CONTROL["intervention_pending"],
+        "intervention_intent": CONTROL["intervention_intent"],
         "topic": html.escape(topic) if topic else "",
+        "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
+        "enabled_agents": enabled_agents,
+        "enabled_agents_label": html.escape(agent_names(enabled_agents)),
+        "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "conn_html": connection_status_html(),
         "active_id": active_id,
+        "memory_dir": html.escape(str(session_memory_dir(active_id))) if active_id else "",
+        "profile_path": html.escape(str(session_profile_path(active_id))) if active_id else "",
+        "total_est_tokens": total_est_tokens,
+        "total_elapsed_time": round(total_elapsed_time, 1),
+        "message_count": len(messages),
+        "active_agent": active_agent,
+        "active_phase": active_phase,
+        "active_elapsed": active_elapsed,
+        "active_cli_mode": active_cli_mode,
+        "active_prompt_chars": active_prompt_chars,
+        "runtime_events": runtime_events,
     }
 
 
@@ -899,25 +1467,101 @@ def session_detail_payload(session_id: str) -> dict | None:
         return None
     messages = data.get("messages", [])
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
-        '<p style="text-align:center;color:#6a6f7c">아직 대화가 없습니다.</p>'
+        '<div class="empty-state">아직 대화가 없습니다.</div>'
     with STATE_LOCK:
         is_active = STATE.get("id") == session_id
     mode = data.get("mode", "discussion")
+    enabled_agents = normalize_enabled_agents(data.get("enabled_agents"))
+    disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     return {
         "id": session_id,
         "feed_html": bubbles,
+        "topic_section_html": topic_section_html(data.get("topic", ""), mode, enabled_agents, session_id),
         "topic": html.escape(data.get("topic", "")),
+        "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
+        "enabled_agents": enabled_agents,
+        "enabled_agents_label": html.escape(agent_names(enabled_agents)),
+        "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
+        "memory_dir": html.escape(str(session_memory_dir(session_id))),
+        "profile_path": html.escape(str(session_profile_path(session_id))),
         "finished": data.get("finished", False),
         "is_active": is_active,
+        "status": "완료" if data.get("finished", False) else "저장됨",
+        "message_count": len(messages),
+        "total_est_tokens": data.get("total_est_tokens", 0),
+        "total_elapsed_time": round(data.get("total_elapsed_time", 0.0), 1),
     }
+
+
+def profile_payload(session_id: str | None = None) -> dict | None:
+    with STATE_LOCK:
+        active_id = STATE.get("id", "")
+        state_snapshot = dict(STATE)
+    target_id = session_id or active_id
+    if not target_id:
+        return None
+    if target_id == active_id:
+        ensure_session_memory(state_snapshot)
+    path = session_profile_path(target_id)
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return {
+        "session_id": target_id,
+        "path": str(path),
+        "content": content,
+        "is_active": target_id == active_id,
+    }
+
+
+def save_profile_content(content: str, session_id: str | None = None) -> dict:
+    with STATE_LOCK:
+        active_id = STATE.get("id", "")
+        state_snapshot = dict(STATE)
+    target_id = session_id or active_id
+    if not target_id:
+        return {"error": "세션이 없습니다."}
+    if target_id == active_id:
+        ensure_session_memory(state_snapshot)
+    path = session_profile_path(target_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    add_runtime_event(f"Profile.md 저장: {path}")
+    return {"success": True, "session_id": target_id, "path": str(path), "content": content}
+
+
+def switch_mode(mode: str) -> dict:
+    if mode not in MODE_LABELS:
+        return {"error": "알 수 없는 모드입니다."}
+    with STATE_LOCK:
+        STATE["mode"] = mode
+        enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+        step_count = len(steps_for_mode(mode, enabled))
+        if STATE.get("topic") and STATE.get("step_index", 0) < step_count:
+            STATE["finished"] = False
+            CONTROL["stopped"] = False
+        save_state(STATE)
+        topic_exists = bool(STATE.get("topic"))
+        should_start = topic_exists and not STATE.get("finished", False)
+    add_runtime_event(f"세션 모드 전환: {MODE_LABELS[mode]}")
+    if should_start:
+        start_worker_if_needed(force=True)
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
 
 
 def maybe_autostart_worker() -> None:
     with STATE_LOCK:
         has_topic = bool(STATE.get("topic"))
         not_finished = not STATE.get("finished", False)
-    if has_topic and not_finished and not CONTROL["stopped"]:
+    if CONTROL["intervention_pending"] and has_topic:
+        start_worker_if_needed(force=True)
+    elif has_topic and not_finished and not CONTROL["stopped"]:
         start_worker_if_needed()
 
 
@@ -949,6 +1593,70 @@ class RoundtableHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/version.json":
+            with STATE_LOCK:
+                messages_count = len(STATE["messages"])
+                finished = STATE.get("finished", False)
+                total_est_tokens = STATE.get("total_est_tokens", 0)
+                total_elapsed_time = STATE.get("total_elapsed_time", 0.0)
+                active_agent = STATE.get("active_agent")
+                active_phase = STATE.get("active_phase")
+                active_started_at = STATE.get("active_started_at")
+                topic = STATE.get("topic", "")
+                mode = STATE.get("mode", "")
+            status = status_text()
+            paused = CONTROL["paused"]
+            stopped = CONTROL["stopped"]
+            awaiting_approval = CONTROL["awaiting_approval"]
+            approval_deferred = CONTROL["approval_deferred"]
+            intervention_pending = CONTROL["intervention_pending"]
+            intervention_intent = CONTROL["intervention_intent"]
+            active_tick = int(time.time()) if active_agent else 0
+            version_str = (
+                f"{messages_count}_{finished}_{total_est_tokens}_{total_elapsed_time}_"
+                f"{active_agent}_{active_phase}_{active_started_at}_{topic}_{mode}_{status}_{paused}_{stopped}_"
+                f"{awaiting_approval}_{approval_deferred}_{intervention_pending}_{intervention_intent}_"
+                f"{len(CONNECTION_STATUS)}_{active_tick}"
+            )
+            self._send_json({"version": version_str})
+            return
+
+        if parsed.path.startswith("/static/"):
+            rel_path = parsed.path.lstrip("/")
+            static_file = (ROOT / rel_path).resolve()
+            static_root = (ROOT / "static").resolve()
+            try:
+                in_static_root = static_file.is_relative_to(static_root)
+            except AttributeError:
+                in_static_root = str(static_file).startswith(str(static_root))
+            if static_file.is_file() and in_static_root:
+                ext = static_file.suffix.lower()
+                content_type = "application/octet-stream"
+                if ext == ".css":
+                    content_type = "text/css; charset=utf-8"
+                elif ext == ".js":
+                    content_type = "application/javascript; charset=utf-8"
+                elif ext == ".png":
+                    content_type = "image/png"
+                elif ext == ".jpg" or ext == ".jpeg":
+                    content_type = "image/jpeg"
+                elif ext == ".svg":
+                    content_type = "image/svg+xml"
+
+                try:
+                    content = static_file.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+                except OSError:
+                    pass
+            self.send_response(404)
+            self.end_headers()
+            return
+
         if parsed.path == "/state.json":
             self._send_json(state_json_payload())
             return
@@ -964,6 +1672,15 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(payload)
             return
+        if parsed.path == "/profile.json":
+            session_id = parse_qs(parsed.query).get("id", [""])[0] or None
+            payload = profile_payload(session_id)
+            if payload is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._send_json(payload)
+            return
         maybe_autostart_worker()
         self._send_html(render_dashboard())
 
@@ -972,15 +1689,20 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             form = self._read_form()
             topic = form.get("topic", [""])[0].strip()
             mode = form.get("mode", ["discussion"])[0].strip()
+            enabled_agents = normalize_enabled_agents(form.get("agent", []))
             if mode not in MODE_LABELS:
                 mode = "discussion"
             if topic:
                 with STATE_LOCK:
                     STATE["topic"] = topic
                     STATE["mode"] = mode
+                    STATE["enabled_agents"] = enabled_agents
                     save_state(STATE)
+                    state_snapshot = dict(STATE)
                 start_log_session()
-                print(f"  \U0001f4cc 토론 주제: {topic} ({MODE_LABELS[mode]})")
+                write_session_transcript_header(state_snapshot)
+                ensure_session_memory(state_snapshot)
+                print(f"  \U0001f4cc 토론 주제: {topic} ({MODE_LABELS[mode]}, 활성: {agent_names(enabled_agents)})")
                 start_worker_if_needed()
             self._send_html(render_dashboard())
             return
@@ -990,6 +1712,19 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             self._send_json(state_json_payload())
             return
 
+        if self.path == "/mode":
+            form = self._read_form()
+            mode = form.get("mode", ["discussion"])[0].strip()
+            self._send_json(switch_mode(mode))
+            return
+
+        if self.path == "/profile":
+            form = self._read_form()
+            session_id = form.get("id", [""])[0].strip() or None
+            content = form.get("content", [""])[0]
+            self._send_json(save_profile_content(content, session_id))
+            return
+
         if self.path == "/restart":
             with STATE_LOCK:
                 STATE.clear()
@@ -997,6 +1732,12 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 save_state(STATE)
             CONTROL["paused"] = False
             CONTROL["awaiting_approval"] = False
+            CONTROL["approval_deferred"] = False
+            CONTROL["approval_seen_messages"] = 0
+            CONTROL["intervention_pending"] = False
+            CONTROL["intervention_intent"] = ""
+            CONTROL["intervention_seen_messages"] = 0
+            CONTROL["intervention_queue"] = []
             CONTROL["stopped"] = True  # 혹시 워커가 돌고 있었다면 다음 체크포인트에서 멈추게
             self._send_html(render_dashboard())
             return
@@ -1004,9 +1745,36 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         if self.path == "/message":
             form = self._read_form()
             text = form.get("text", [""])[0].strip()
-            if text:
-                add_message("user", "사용자 개입", text)
-            self._send_json(state_json_payload())
+            intent = form.get("intent", ["question"])[0].strip()
+            targets = normalize_target_agents(form.get("target", []))
+            spec = INTERVENTION_INTENTS.get(intent, INTERVENTION_INTENTS["question"])
+            if not text:
+                self._send_json({"error": "메시지 내용이 비어 있습니다."})
+                return
+
+            try:
+                target_suffix = f" → {agent_names(targets)}" if intent != "note" else ""
+                with STATE_LOCK:
+                    initial_msg_count = len(STATE["messages"])
+
+                add_message("user", spec["phase"] + target_suffix, text)
+
+                with STATE_LOCK:
+                    current_msg_count = len(STATE["messages"])
+                    has_topic = bool(STATE.get("topic"))
+
+                if current_msg_count <= initial_msg_count:
+                    raise RuntimeError("대화 이력(STATE)에 메시지가 기록되지 않았습니다.")
+
+                mark_intervention(intent, targets)
+                if intent != "note" and has_topic:
+                    start_worker_if_needed(force=True)
+
+                payload = state_json_payload()
+                payload["success"] = True
+                self._send_json(payload)
+            except Exception as e:
+                self._send_json({"error": f"백엔드 큐 등록 오류: {str(e)}"})
             return
 
         if self.path == "/pause":
@@ -1022,11 +1790,25 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         if self.path == "/stop":
             CONTROL["stopped"] = True
             CONTROL["paused"] = False
+            CONTROL["approval_deferred"] = False
+            CONTROL["intervention_pending"] = False
+            CONTROL["intervention_intent"] = ""
+            CONTROL["intervention_queue"] = []
             self._send_json(state_json_payload())
             return
 
         if self.path == "/approve":
             CONTROL["awaiting_approval"] = False
+            CONTROL["approval_deferred"] = False
+            CONTROL["intervention_pending"] = False
+            CONTROL["intervention_intent"] = ""
+            CONTROL["intervention_queue"] = []
+            self._send_json(state_json_payload())
+            return
+
+        if self.path == "/defer":
+            if CONTROL["awaiting_approval"]:
+                CONTROL["approval_deferred"] = True
             self._send_json(state_json_payload())
             return
 
