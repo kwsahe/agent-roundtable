@@ -48,7 +48,7 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 for stream in (sys.stdout, sys.stderr):
     try:
@@ -60,6 +60,7 @@ ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "roundtable_state.json"
 HTML_PATH = ROOT / "roundtable.html"
 LOG_PATH = ROOT / "roundtable_log.md"
+SESSIONS_DIR = ROOT / "sessions"
 TEAM_PROMPT_PATH = ROOT / "TEAM_PROMPT.md"
 PROFILE_PATHS = {
     "codex": ROOT / "CODEX_Profile.md",
@@ -379,6 +380,20 @@ def preflight() -> None:
         sys.exit(1)
 
 
+def _finalize_cli_result(tool_name: str, result) -> str:
+    """subprocess 결과를 응답 문자열로 정리한다. 실패/빈 응답을 구분해서 원인을 남긴다."""
+    if result is None:
+        return f"({tool_name} 응답 없음 — 실행 실패: 프로세스를 실행하지 못함)"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return f"({tool_name} 응답 없음 — 종료 코드 {result.returncode}: {detail[:300]})"
+    text = result.stdout.strip()
+    if not text:
+        stderr = (result.stderr or "").strip()
+        return f"({tool_name}가 빈 응답을 반환함" + (f" — stderr: {stderr[:300]}" if stderr else "") + ")"
+    return text
+
+
 def ask_codex(prompt: str, mode: str = "discussion") -> str:
     sandbox = "workspace-write" if mode == "coding" else "read-only"
     result = run_cli(
@@ -388,12 +403,7 @@ def ask_codex(prompt: str, mode: str = "discussion") -> str:
         timeout=CODEX_TIMEOUT,
         cwd=load_project_path(),
     )
-    if result is None:
-        return "(Codex 응답 없음 — 실행 실패)"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        return f"(Codex 응답 없음 — 실행 실패: {detail[:300]})"
-    return result.stdout.strip()
+    return _finalize_cli_result("Codex", result)
 
 
 def ask_claude(prompt: str, mode: str = "discussion") -> str:
@@ -405,12 +415,7 @@ def ask_claude(prompt: str, mode: str = "discussion") -> str:
         timeout=CLAUDE_TIMEOUT,
         cwd=load_project_path(),
     )
-    if result is None:
-        return "(Claude Code 응답 없음 — 실행 실패)"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        return f"(Claude Code 응답 없음 — 실행 실패: {detail[:300]})"
-    return result.stdout.strip()
+    return _finalize_cli_result("Claude Code", result)
 
 
 def ask_antigravity(prompt: str, mode: str = "discussion") -> str:
@@ -420,12 +425,7 @@ def ask_antigravity(prompt: str, mode: str = "discussion") -> str:
     else:
         args = ["--mode", "plan", "--sandbox", "--print", prompt]
     result = run_cli("Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=load_project_path())
-    if result is None:
-        return "(Antigravity 응답 없음 — 실행 실패)"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        return f"(Antigravity 응답 없음 — 실행 실패: {detail[:300]})"
-    return result.stdout.strip()
+    return _finalize_cli_result("Antigravity", result)
 
 
 ASK_FUNCS = {
@@ -439,14 +439,30 @@ ASK_FUNCS = {
 # 상태 / 로그 / 프로필
 # ──────────────────────────────────────────
 
+def new_session_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
 def new_state() -> dict:
-    return {"messages": [], "step_index": 0, "finished": False, "topic": "", "mode": "discussion"}
+    return {
+        "id": new_session_id(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "messages": [],
+        "step_index": 0,
+        "finished": False,
+        "topic": "",
+        "mode": "discussion",
+    }
 
 
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if "id" not in state:
+                state["id"] = new_session_id()
+                state["created_at"] = datetime.now().isoformat(timespec="seconds")
+            return state
         except json.JSONDecodeError:
             pass
     return new_state()
@@ -454,6 +470,42 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    session_id = state.get("id")
+    if session_id:
+        (SESSIONS_DIR / f"{session_id}.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+
+def list_sessions() -> list[dict]:
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    summaries = []
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        summaries.append({
+            "id": data.get("id", path.stem),
+            "topic": data.get("topic", ""),
+            "mode": data.get("mode", "discussion"),
+            "finished": data.get("finished", False),
+            "created_at": data.get("created_at", ""),
+            "message_count": len(data.get("messages", [])),
+        })
+    summaries.sort(key=lambda s: s["created_at"], reverse=True)
+    return summaries
+
+
+def load_session(session_id: str) -> dict | None:
+    path = SESSIONS_DIR / f"{session_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def append_log(agent: str, phase: str, text: str) -> None:
@@ -509,11 +561,23 @@ def bubble_html(m: dict) -> str:
     side = agent["side"]
     phase = m.get("phase", "")
     highlight_class = " report" if phase == "최종 보고" else (" confirm" if phase == CONFIRM_PHASE else "")
+
+    meta = m.get("meta")
+    stats_html = ""
+    if meta:
+        stats_html = (
+            f'<div class="stats">⏱ {meta["elapsed"]}초 · '
+            f'추정 토큰 ~{meta["est_tokens"]} · '
+            f'입력 {meta["prompt_chars"]}자/출력 {meta["output_chars"]}자 · '
+            f'{html.escape(meta["cli_mode"])}</div>'
+        )
+
     return f"""
     <div class="row {side}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
         <div class="meta"><span class="name">{html.escape(agent['label'])}</span><span class="phase">{html.escape(m.get('phase', ''))}</span><span class="time">{html.escape(m['time'])}</span></div>
         <div class="text">{html.escape(m['text']).replace(chr(10), '<br>')}</div>
+        {stats_html}
       </div>
     </div>"""
 
@@ -535,9 +599,12 @@ def render_html_snapshot() -> None:
     HTML_PATH.write_text(render_dashboard(), encoding="utf-8")
 
 
-def add_message(agent: str, phase: str, text: str) -> None:
+def add_message(agent: str, phase: str, text: str, meta: dict | None = None) -> None:
     with STATE_LOCK:
-        STATE["messages"].append({"agent": agent, "phase": phase, "time": ts(), "text": text})
+        message = {"agent": agent, "phase": phase, "time": ts(), "text": text}
+        if meta:
+            message["meta"] = meta
+        STATE["messages"].append(message)
         save_state(STATE)
     append_log(agent, phase, text)
     render_html_snapshot()
@@ -566,7 +633,14 @@ def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
     print(f"✅ {label} 응답 완료 — {elapsed:.1f}초, 추정 토큰 ~{est_tokens} "
           f"(입력 {len(prompt)}자 / 출력 {len(text)}자)")
     print(text)
-    add_message(agent, phase, text)
+    meta = {
+        "elapsed": round(elapsed, 1),
+        "est_tokens": est_tokens,
+        "cli_mode": cli_mode,
+        "prompt_chars": len(prompt),
+        "output_chars": len(text),
+    }
+    add_message(agent, phase, text, meta)
 
 
 def worker_loop() -> None:
@@ -717,6 +791,7 @@ def state_json_payload() -> dict:
         finished = STATE.get("finished", False)
         topic = STATE.get("topic", "").strip()
         mode = STATE.get("mode", "discussion")
+        active_id = STATE.get("id", "")
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<p style="text-align:center;color:#6a6f7c">아직 대화가 없습니다.</p>'
     return {
@@ -729,6 +804,41 @@ def state_json_payload() -> dict:
         "topic": html.escape(topic) if topic else "",
         "mode_label": MODE_LABELS.get(mode, mode),
         "conn_html": connection_status_html(),
+        "active_id": active_id,
+    }
+
+
+def sessions_list_payload() -> dict:
+    with STATE_LOCK:
+        active_id = STATE.get("id", "")
+    items = []
+    for s in list_sessions():
+        items.append({
+            **s,
+            "topic": s["topic"] or "(주제 없음)",
+            "mode_label": MODE_LABELS.get(s["mode"], s["mode"]),
+            "is_active": s["id"] == active_id,
+        })
+    return {"sessions": items, "active_id": active_id}
+
+
+def session_detail_payload(session_id: str) -> dict | None:
+    data = load_session(session_id)
+    if data is None:
+        return None
+    messages = data.get("messages", [])
+    bubbles = "".join(bubble_html(m) for m in messages) if messages else \
+        '<p style="text-align:center;color:#6a6f7c">아직 대화가 없습니다.</p>'
+    with STATE_LOCK:
+        is_active = STATE.get("id") == session_id
+    mode = data.get("mode", "discussion")
+    return {
+        "id": session_id,
+        "feed_html": bubbles,
+        "topic": html.escape(data.get("topic", "")),
+        "mode_label": MODE_LABELS.get(mode, mode),
+        "finished": data.get("finished", False),
+        "is_active": is_active,
     }
 
 
@@ -767,8 +877,21 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         return parse_qs(body)
 
     def do_GET(self) -> None:
-        if self.path.startswith("/state.json"):
+        parsed = urlparse(self.path)
+        if parsed.path == "/state.json":
             self._send_json(state_json_payload())
+            return
+        if parsed.path == "/sessions.json":
+            self._send_json(sessions_list_payload())
+            return
+        if parsed.path == "/session.json":
+            session_id = parse_qs(parsed.query).get("id", [""])[0]
+            payload = session_detail_payload(session_id)
+            if payload is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._send_json(payload)
             return
         maybe_autostart_worker()
         self._send_html(render_dashboard())
