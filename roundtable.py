@@ -37,6 +37,8 @@ Agent Roundtable — Codex, Antigravity & Claude Code
 
 import html
 import json
+import locale
+import math
 import os
 import re
 import shlex
@@ -208,8 +210,16 @@ AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
 PORT = int(os.environ.get("ROUNDTABLE_PORT", "8765"))
 # 프롬프트에 매번 재전송할 최근 대화 개수 — 전체 기록은 roundtable_memory/<id>/full.md에
 # 남기고, 프롬프트에는 요약 + 최근 메시지만 넣어 토큰 낭비를 줄인다.
-TRANSCRIPT_WINDOW = int(os.environ.get("ROUNDTABLE_TRANSCRIPT_WINDOW", "3"))
-MEMORY_BRIEF_LINES = int(os.environ.get("ROUNDTABLE_MEMORY_BRIEF_LINES", "18"))
+TRANSCRIPT_WINDOW = int(os.environ.get("ROUNDTABLE_TRANSCRIPT_WINDOW", "2"))
+MEMORY_BRIEF_LINES = int(os.environ.get("ROUNDTABLE_MEMORY_BRIEF_LINES", "6"))
+TRANSCRIPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TRANSCRIPT_MAX_CHARS", "1600"))
+MEMORY_CONTEXT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_MEMORY_CONTEXT_MAX_CHARS", "1800"))
+TEAM_PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TEAM_PROMPT_MAX_CHARS", "1400"))
+PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_PROMPT_MAX_CHARS", "5000"))
+OUTPUT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_OUTPUT_MAX_CHARS", "2000"))
+PROJECT_SNAPSHOT_MAX_ENTRIES = int(os.environ.get("ROUNDTABLE_SNAPSHOT_MAX_ENTRIES", "20000"))
+
+APPROVAL_TOKEN = "APPROVE"
 
 AGENTS = {
     "codex": {"label": "Codex", "color": "#4f8cff", "side": "left", "avatar": "/static/agents/codex.svg"},
@@ -350,7 +360,8 @@ def make_confirm_step(enabled_agents: list[str]) -> tuple[str, str, str, str]:
         reporter, CONFIRM_PHASE,
         "지금까지 활성화된 에이전트들의 제안을 참고해서, 각자의 개선/수정 계획 전체를 "
         "하나로 정리하고 팀장(사용자)에게 실제로 진행해도 될지 확인을 요청하는 메시지를 "
-        "작성해. 비활성화된 에이전트가 누구인지도 명시해. 아직 실제로 파일을 수정하지 마.",
+        "작성해. 비활성화된 에이전트가 누구인지도 명시해. 아직 실제로 파일을 수정하지 말고, "
+        f"마지막 줄에 {APPROVAL_TOKEN}만 써라.",
         "discussion",
     )
 
@@ -430,12 +441,93 @@ def print_cli_hint(tool_name: str, command: str, error: str) -> None:
         print("     해결: Codex CLI가 PATH에 있는지, 로그인이 되어 있는지 확인하세요.")
 
 
-def run_cli(tool_name: str, command: str, args: list[str], *, timeout: int | None = None, cwd: Path | None = None):
+def decode_cli_output(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    encodings = ["utf-8", locale.getpreferredencoding(False), "cp949"]
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return value.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return value.decode("utf-8", errors="replace")
+
+
+def snapshot_project_tree(root: Path) -> tuple[dict[str, tuple], bool]:
+    """코딩 턴 전후 비교용 경량 파일 트리 스냅샷."""
+    entries: dict[str, tuple] = {}
+    skipped_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    if not root.is_dir():
+        return entries, False
+    truncated = False
+    for current, dirs, files in os.walk(root):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(root)
+        for name in dirs:
+            rel = (relative_dir / name).as_posix() + "/"
+            entries[rel] = ("dir",)
+            if len(entries) >= PROJECT_SNAPSHOT_MAX_ENTRIES:
+                truncated = True
+                break
+        if truncated:
+            break
+        dirs[:] = [name for name in dirs if name not in skipped_dirs]
+        for name in files:
+            path = current_path / name
+            rel = (relative_dir / name).as_posix()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries[rel] = ("file", stat.st_size, stat.st_mtime_ns)
+            if len(entries) >= PROJECT_SNAPSHOT_MAX_ENTRIES:
+                truncated = True
+                break
+        if truncated:
+            break
+    return entries, truncated
+
+
+def compare_project_snapshots(before: dict[str, tuple], after: dict[str, tuple]) -> list[dict[str, str]]:
+    changes = []
+    for path in sorted(before.keys() | after.keys()):
+        if path not in before:
+            change = "생성"
+        elif path not in after:
+            change = "삭제"
+        elif before[path] != after[path]:
+            change = "수정"
+        else:
+            continue
+        changes.append({"path": path, "change": change})
+    return changes
+
+
+def run_cli(
+    tool_name: str,
+    command: str,
+    args: list[str],
+    *,
+    timeout: int | None = None,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+):
     cmd = resolve_command(command) + args
     try:
-        return subprocess.run(
-            cmd, cwd=cwd or ROOT, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+        result = subprocess.run(
+            cmd,
+            cwd=cwd or ROOT,
+            capture_output=True,
+            input=input_text.encode("utf-8") if input_text is not None else None,
+            timeout=timeout,
+        )
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            decode_cli_output(result.stdout),
+            decode_cli_output(result.stderr),
         )
     except FileNotFoundError as exc:
         print_cli_hint(tool_name, command, f"명령을 찾을 수 없음 ({exc})")
@@ -507,9 +599,10 @@ def ask_codex(prompt: str, mode: str = "discussion") -> str:
     result = run_cli(
         "Codex",
         CODEX_CMD,
-        ["exec", "--sandbox", sandbox, "--skip-git-repo-check", prompt],
+        ["exec", "--sandbox", sandbox, "--skip-git-repo-check", "-"],
         timeout=CODEX_TIMEOUT,
         cwd=load_project_path(),
+        input_text=prompt,
     )
     return _finalize_cli_result("Codex", result)
 
@@ -599,7 +692,14 @@ def normalize_state(state: dict) -> dict:
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
-            return normalize_state(json.loads(STATE_PATH.read_text(encoding="utf-8")))
+            state = normalize_state(json.loads(STATE_PATH.read_text(encoding="utf-8")))
+            # 프로세스가 새로 시작됐다면 이전 프로세스의 실행 중 표시는 더 이상 유효하지 않다.
+            state["active_agent"] = None
+            state["active_phase"] = None
+            state["active_started_at"] = None
+            state["active_cli_mode"] = None
+            state["active_prompt_chars"] = 0
+            return state
         except json.JSONDecodeError:
             pass
     return new_state()
@@ -826,8 +926,16 @@ def build_transcript(messages: list[dict], window: int | None = None) -> str:
         lines.append(f"(이전 {omitted}개 메시지는 생략됨 — 최근 {len(windowed)}개만 표시)")
     for m in windowed:
         label = AGENTS[m["agent"]]["label"]
-        lines.append(f"[{label}] ({m['phase']}): {m['text']}")
-    return "\n\n".join(lines)
+        message_text = m["text"]
+        if len(message_text) > 2200:
+            message_text = message_text[:1100] + "\n... (메시지 중간 생략) ...\n" + message_text[-1100:]
+        lines.append(f"[{label}] ({m['phase']}): {message_text}")
+    transcript = "\n\n".join(lines)
+    if len(transcript) > TRANSCRIPT_MAX_CHARS:
+        notice = "(최근 대화 일부 생략)\n\n"
+        remaining = max(0, TRANSCRIPT_MAX_CHARS - len(notice))
+        transcript = (notice + (transcript[-remaining:] if remaining else ""))[:TRANSCRIPT_MAX_CHARS]
+    return transcript
 
 
 def read_brief_tail(session_id: str, max_lines: int = MEMORY_BRIEF_LINES) -> str:
@@ -852,29 +960,81 @@ def build_memory_context(state: dict) -> str:
     enabled = normalize_enabled_agents(state.get("enabled_agents"))
     disabled = [a for a in AGENT_ORDER if a not in enabled]
     brief_tail = read_brief_tail(session_id)
-    profile_tail = read_profile_tail(profile_path)
     lines = [
-        "공유 메모리:",
+        "세션 외부 메모리 (필요할 때만 파일을 직접 읽기):",
         f"- 전체 기록 파일: {full_path}",
         f"- 압축 요약 파일: {brief_path}",
         f"- 세션 역할 프로필: {profile_path}",
-        "- 모델별 프로필:",
-        *[f"  - {AGENTS[a]['label']}: {session_agent_profile_path(session_id, a)}" for a in enabled],
         f"- 활성 에이전트: {agent_names(enabled)}",
         f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}",
         "",
         "규칙:",
-        "- 전체 채팅을 프롬프트에 반복해서 붙이지 않는다.",
-        "- 필요한 경우 위 전체 기록 파일을 직접 열어 확인한다.",
-        "- 역할/강점/분담은 세션 역할 프로필을 skill처럼 읽고 따른다.",
+        "- 전체 기록과 Profile.md 전문은 현재 프롬프트에 포함되지 않았다.",
+        "- 역할 결정이나 과거 근거가 꼭 필요할 때만 해당 파일을 직접 읽는다.",
         "- 역할이 바뀌면 응답에 명확히 남겨라. 시스템이 이 세션 프로필에 기록한다.",
         "- 비활성 에이전트는 이번 세션에서 발언/작업하지 않는다는 점을 고려한다.",
     ]
-    if profile_tail:
-        lines.extend(["", "최근 세션 역할 프로필:", profile_tail])
     if brief_tail:
-        lines.extend(["", "최근 압축 요약:", brief_tail])
-    return "\n".join(lines)
+        lines.extend(["", "짧은 세션 요약:", brief_tail])
+    context = "\n".join(lines)
+    if len(context) > MEMORY_CONTEXT_MAX_CHARS:
+        fixed = "\n".join(lines[:16])
+        notice = "\n\n(이전 메모리 일부 생략)\n"
+        remaining = max(0, MEMORY_CONTEXT_MAX_CHARS - len(fixed) - len(notice))
+        tail = context[-remaining:] if remaining else ""
+        context = (fixed + notice + tail)[:MEMORY_CONTEXT_MAX_CHARS]
+    return context
+
+
+def clip_agent_output(text: str, max_chars: int = OUTPUT_MAX_CHARS) -> tuple[str, bool]:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text, False
+    notice = "(앞부분 자동 축약)\n\n"
+    remaining = max(0, max_chars - len(notice))
+    return (notice + (text[-remaining:] if remaining else ""))[:max_chars], True
+
+
+def extract_approval_token(text: str) -> tuple[str, bool]:
+    lines = text.rstrip().splitlines()
+    if lines and lines[-1].strip().upper() == APPROVAL_TOKEN:
+        return "\n".join(lines[:-1]).rstrip(), True
+    return text, False
+
+
+def compose_agent_prompt(
+    team_prompt: str,
+    topic: str,
+    memory_context: str,
+    transcript: str,
+    instruction: str,
+) -> str:
+    team_prompt = team_prompt[:TEAM_PROMPT_MAX_CHARS]
+    topic = topic[:500]
+    instruction = instruction[:1200]
+    header = (
+        "모든 사용자 노출 문장은 한국어로 쓴다. 파일명·명령어·코드 식별자만 원문을 유지한다.\n"
+        "도구 실행 계획과 탐색 과정을 출력하지 말고 결론만 최대 6개 항목, 1,200자 이내로 답한다.\n"
+        f"사용자 승인이 꼭 필요하면 설명을 마친 뒤 마지막 줄에 {APPROVAL_TOKEN}만 쓴다. "
+        f"승인이 필요하지 않으면 {APPROVAL_TOKEN}를 쓰지 않는다.\n\n"
+    )
+    current_task = f"\n\n현재 주제: {topic}\n현재 작업: {instruction}\n"
+    base = f"{header}{team_prompt}{current_task}"
+    context_parts = []
+    if memory_context:
+        context_parts.append(memory_context)
+    if transcript:
+        context_parts.append(f"최근 대화:\n{transcript}")
+    context = "\n\n".join(context_parts)
+    available = max(0, PROMPT_MAX_CHARS - len(base) - 24)
+    if len(context) > available:
+        notice = "\n... 문맥 축약 ...\n"
+        remaining = max(0, available - len(notice))
+        head_size = remaining // 2
+        tail_size = remaining - head_size
+        context = context[:head_size] + notice + (context[-tail_size:] if tail_size else "")
+    prompt = f"{header}{team_prompt}\n\n{context}{current_task}"
+    return prompt[:PROMPT_MAX_CHARS]
 
 
 # ──────────────────────────────────────────
@@ -887,14 +1047,42 @@ CONTROL = {
     "paused": False,
     "stopped": False,
     "worker_running": False,
+    "worker_session_id": None,
+    "worker_start_pending": False,
     "awaiting_approval": False,
     "approval_deferred": False,
+    "approval_requested": False,
+    "approval_requested_by": [],
+    "approval_rejected": False,
     "approval_seen_messages": 0,
     "intervention_pending": False,
     "intervention_seen_messages": 0,
     "intervention_intent": "",
     "intervention_queue": [],
 }
+
+
+def unresolved_approval_requesters(messages: list[dict]) -> list[str]:
+    requesters: list[str] = []
+    for message in reversed(messages):
+        if message.get("agent") == "user" and message.get("phase") in {"승인", "승인 거절"}:
+            break
+        if not message.get("meta", {}).get("approval_requested"):
+            continue
+        agent = message.get("agent", "")
+        label = AGENTS.get(agent, {}).get("label", agent or "에이전트")
+        requester = f"{label} · {message.get('phase', '승인 요청')}"
+        if requester not in requesters:
+            requesters.append(requester)
+    requesters.reverse()
+    return requesters
+
+
+_restored_approval_requesters = unresolved_approval_requesters(STATE.get("messages", []))
+if _restored_approval_requesters:
+    CONTROL["approval_requested"] = True
+    CONTROL["approval_requested_by"] = _restored_approval_requesters
+    CONTROL["awaiting_approval"] = True
 
 
 def add_runtime_event(text: str, level: str = "info") -> None:
@@ -909,6 +1097,16 @@ def add_runtime_event(text: str, level: str = "info") -> None:
         events.append(event)
         del events[:-80]
         save_state(STATE)
+
+
+def mark_approval_requested(agent: str, phase: str) -> None:
+    requester = f"{AGENTS[agent]['label']} · {phase}"
+    with STATE_LOCK:
+        CONTROL["approval_requested"] = True
+        CONTROL["approval_rejected"] = False
+        requesters = CONTROL.setdefault("approval_requested_by", [])
+        if requester not in requesters:
+            requesters.append(requester)
 
 
 # ──────────────────────────────────────────
@@ -986,11 +1184,13 @@ def bubble_html(m: dict) -> str:
     meta = m.get("meta")
     stats_html = ""
     if meta:
+        changed_paths = meta.get("changed_paths", [])
+        changes_html = f' · 파일 변경 {len(changed_paths)}개' if meta.get("cli_mode") == "coding" else ""
         stats_html = (
             f'<div class="stats">⏱ {meta["elapsed"]}초 · '
             f'추정 토큰 ~{meta["est_tokens"]} · '
             f'입력 {meta["prompt_chars"]}자/출력 {meta["output_chars"]}자 · '
-            f'{html.escape(meta["cli_mode"])}</div>'
+            f'{html.escape(meta["cli_mode"])}{changes_html}</div>'
         )
 
     return f"""
@@ -1009,6 +1209,8 @@ def bubble_html(m: dict) -> str:
 
 
 def status_text() -> str:
+    if not STATE.get("topic"):
+        return "주제 입력 대기"
     active_agent = STATE.get("active_agent")
     if active_agent:
         label = AGENTS.get(active_agent, {}).get("label", active_agent)
@@ -1018,6 +1220,8 @@ def status_text() -> str:
         return "사용자 개입 처리 대기 중"
     if STATE.get("finished"):
         return "완료"
+    if CONTROL["approval_rejected"]:
+        return "승인 거절됨"
     if CONTROL["stopped"]:
         return "중단됨"
     if CONTROL["awaiting_approval"]:
@@ -1034,8 +1238,16 @@ def render_html_snapshot() -> None:
     HTML_PATH.write_text(render_dashboard(), encoding="utf-8")
 
 
-def add_message(agent: str, phase: str, text: str, meta: dict | None = None) -> None:
+def add_message(
+    agent: str,
+    phase: str,
+    text: str,
+    meta: dict | None = None,
+    expected_session_id: str | None = None,
+) -> bool:
     with STATE_LOCK:
+        if expected_session_id and STATE.get("id") != expected_session_id:
+            return False
         message = {"agent": agent, "phase": phase, "time": ts(), "text": text}
         if meta:
             message["meta"] = meta
@@ -1049,6 +1261,7 @@ def add_message(agent: str, phase: str, text: str, meta: dict | None = None) -> 
     append_memory(session_id, agent, phase, text, meta)
     append_session_role_profile(session_id, agent, phase, text)
     render_html_snapshot()
+    return True
 
 
 INTERVENTION_INTENTS = {
@@ -1099,12 +1312,11 @@ def intervention_responder() -> str:
 
 
 def normalize_target_agents(targets: list[str] | None) -> list[str]:
-    normalized = [agent for agent in (targets or []) if agent in AGENT_ORDER]
-    if normalized:
-        return normalized
     with STATE_LOCK:
         enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
-    return enabled
+    if targets is None:
+        return enabled
+    return [agent for agent in targets if agent in enabled]
 
 
 def mark_intervention(intent: str, targets: list[str] | None = None) -> None:
@@ -1122,7 +1334,10 @@ def mark_intervention(intent: str, targets: list[str] | None = None) -> None:
         })
 
 
-def process_pending_intervention() -> bool:
+def process_pending_intervention(expected_session_id: str | None = None) -> bool:
+    with STATE_LOCK:
+        if expected_session_id and STATE.get("id") != expected_session_id:
+            return False
     if not CONTROL["intervention_pending"]:
         return False
     with STATE_LOCK:
@@ -1141,7 +1356,15 @@ def process_pending_intervention() -> bool:
             f"이번 개입의 직접 대상 모델: {agent_names(targets)}.\n"
             f"너({AGENTS[responder]['label']})에게 직접 질문/지시가 왔다고 보고 답해라."
         )
-        run_step(responder, "개입 답변", target_instruction, "discussion")
+        if not run_step(
+            responder,
+            "개입 답변",
+            target_instruction,
+            "discussion",
+            expected_session_id=expected_session_id,
+        ):
+            CONTROL["paused"] = True
+            return True
     with STATE_LOCK:
         CONTROL["intervention_seen_messages"] = len(STATE["messages"])
     if spec["pause_after"]:
@@ -1150,34 +1373,69 @@ def process_pending_intervention() -> bool:
     return True
 
 
+def wait_for_user_approval(session_id: str) -> bool:
+    with STATE_LOCK:
+        if STATE.get("id") != session_id:
+            return False
+        CONTROL["awaiting_approval"] = True
+        CONTROL["approval_deferred"] = False
+        CONTROL["approval_rejected"] = False
+        CONTROL["approval_seen_messages"] = len(STATE["messages"])
+    separator("사용자 승인 대기 중 — 승인해야 다음 단계가 진행됩니다")
+    while CONTROL["awaiting_approval"] and not CONTROL["stopped"]:
+        with STATE_LOCK:
+            if STATE.get("id") != session_id:
+                return False
+            message_count = len(STATE["messages"])
+            last_message = STATE["messages"][-1] if STATE["messages"] else None
+        if message_count > CONTROL["approval_seen_messages"]:
+            CONTROL["approval_seen_messages"] = message_count
+            if last_message and last_message.get("agent") == "user":
+                CONTROL["approval_deferred"] = True
+                process_pending_intervention(session_id)
+                with STATE_LOCK:
+                    CONTROL["approval_seen_messages"] = len(STATE["messages"])
+        time.sleep(0.3)
+    return not CONTROL["approval_rejected"] and not CONTROL["stopped"]
+
+
 # ──────────────────────────────────────────
 # 워커 (에이전트 호출 루프) — 백그라운드 스레드
 # ──────────────────────────────────────────
 
-def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
+def estimate_tokens(*texts: str) -> int:
+    """한국어도 과소 계산하지 않도록 UTF-8 바이트를 이용한 거친 토큰 추정치."""
+    return max(1, math.ceil(sum(len(text.encode("utf-8")) for text in texts) / 4))
+
+
+def is_cli_failure(text: str) -> bool:
+    return "응답 없음" in text or "빈 응답" in text
+
+
+def run_step(
+    agent: str,
+    phase: str,
+    instruction: str,
+    cli_mode: str,
+    *,
+    expected_session_id: str | None = None,
+) -> bool:
     label = AGENTS[agent]["label"]
     separator(f"{label} — {phase}")
     with STATE_LOCK:
+        if expected_session_id and STATE.get("id") != expected_session_id:
+            return False
+        session_id = STATE.get("id")
         state_snapshot = dict(STATE)
         topic = STATE.get("topic", "").strip()
         transcript = build_transcript(STATE["messages"], window=TRANSCRIPT_WINDOW)
     memory_context = build_memory_context(state_snapshot)
     team_prompt = load_team_prompt()
-    topic_line = f"오늘 다룰 주제/프로젝트: {topic}\n\n" if topic else ""
-    if transcript:
-        body = f"{memory_context}\n\n최근 대화 기록:\n\n{transcript}\n\n---\n\n{instruction}"
-    else:
-        body = f"{memory_context}\n\n---\n\n{instruction}" if memory_context else instruction
-    prompt = (
-        "아래 공통 지침은 완전한 전문이다. 사용자에게 공통 지침을 이어서 보내 달라고 "
-        "요청하지 말고, 이 지침과 이어지는 작업 지시만 기준으로 바로 응답해라.\n"
-        "중요: 사용자에게 보이는 모든 출력은 반드시 한국어로 작성해라. CLI 내부 계획, 도구 실행 계획, "
-        "작업 설명, 최종 요약도 영어로 쓰지 마라. 파일명/명령어/코드 식별자만 원문을 유지해도 된다.\n"
-        "Important: respond to the user in Korean only. Do not write visible planning text in English.\n\n"
-        f"{team_prompt}\n\n---\n\n{topic_line}{body}"
-    )
+    prompt = compose_agent_prompt(team_prompt, topic, memory_context, transcript, instruction)
 
     with STATE_LOCK:
+        if expected_session_id and STATE.get("id") != expected_session_id:
+            return False
         STATE["active_agent"] = agent
         STATE["active_phase"] = phase
         STATE["active_started_at"] = time.time()
@@ -1187,10 +1445,27 @@ def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
     add_runtime_event(f"{label} — {phase} 시작 (cli_mode={cli_mode}, 입력 {len(prompt)}자)")
     render_html_snapshot()
     print(f"\U0001f914 {label} 생각 중... (입력 약 {len(prompt)}자, cli_mode={cli_mode})")
+    project_path = load_project_path()
+    before_snapshot, before_truncated = (
+        snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
+    )
     t0 = time.time()
-    text = ASK_FUNCS[agent](prompt, cli_mode)
+    try:
+        raw_text = ASK_FUNCS[agent](prompt, cli_mode)
+    except Exception as exc:
+        raw_text = f"({label} 응답 없음 — 실행 중 예외: {exc})"
     elapsed = time.time() - t0
-    est_tokens = (len(prompt) + len(text)) // 4
+    after_snapshot, after_truncated = (
+        snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
+    )
+    changed_paths = compare_project_snapshots(before_snapshot, after_snapshot) if cli_mode == "coding" else []
+    visible_text, approval_requested = extract_approval_token(raw_text)
+    text, output_truncated = clip_agent_output(visible_text)
+    if approval_requested and not text:
+        text = "사용자 승인을 요청했습니다."
+    est_tokens = estimate_tokens(prompt, raw_text)
+    failed = is_cli_failure(raw_text)
+    approval_requested = approval_requested and not failed
     print(f"✅ {label} 응답 완료 — {elapsed:.1f}초, 추정 토큰 ~{est_tokens} "
           f"(입력 {len(prompt)}자 / 출력 {len(text)}자)")
     print(text)
@@ -1200,93 +1475,144 @@ def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
         "cli_mode": cli_mode,
         "prompt_chars": len(prompt),
         "output_chars": len(text),
+        "raw_output_chars": len(raw_text),
+        "output_truncated": output_truncated,
+        "approval_requested": approval_requested,
+        "ok": not failed,
+        "changed_paths": changed_paths[:100],
+        "snapshot_truncated": before_truncated or after_truncated or len(changed_paths) > 100,
     }
     with STATE_LOCK:
-        STATE["active_agent"] = None
-        STATE["active_phase"] = None
-        STATE["active_started_at"] = None
-        STATE["active_cli_mode"] = None
-        STATE["active_prompt_chars"] = 0
-        save_state(STATE)
-    add_runtime_event(f"{label} — {phase} 완료 ({elapsed:.1f}초, 추정 토큰 ~{est_tokens})")
-    add_message(agent, phase, text, meta)
+        same_session = STATE.get("id") == session_id
+        if same_session:
+            STATE["active_agent"] = None
+            STATE["active_phase"] = None
+            STATE["active_started_at"] = None
+            STATE["active_cli_mode"] = None
+            STATE["active_prompt_chars"] = 0
+            save_state(STATE)
+    if not same_session:
+        print(f"  \u26a0\ufe0f {label} 응답은 새 세션이 시작되어 폐기했습니다.")
+        return False
+    level = "error" if failed else "info"
+    result_label = "실패" if failed else "완료"
+    add_runtime_event(
+        f"{label} — {phase} {result_label} ({elapsed:.1f}초, 추정 토큰 ~{est_tokens})",
+        level=level,
+    )
+    if approval_requested:
+        mark_approval_requested(agent, phase)
+        add_runtime_event(f"승인 요청 감지: {label} · {phase}")
+    if cli_mode == "coding":
+        if changed_paths:
+            preview = ", ".join(f"{item['change']} {item['path']}" for item in changed_paths[:6])
+            suffix = " ..." if len(changed_paths) > 6 else ""
+            add_runtime_event(f"파일 변경 감지 {len(changed_paths)}개: {preview}{suffix}")
+        else:
+            add_runtime_event("파일 변경 감지: 없음")
+    added = add_message(agent, phase, text, meta, expected_session_id=session_id)
+    return added and not failed
 
 
-def worker_loop() -> None:
+def worker_loop(session_id: str) -> None:
+    restart_pending = False
     try:
         while True:
             with STATE_LOCK:
+                if STATE.get("id") != session_id:
+                    break
                 mode = STATE.get("mode", "discussion")
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
                 step_index = STATE["step_index"]
-            if process_pending_intervention():
+            if CONTROL["approval_requested"]:
+                if not wait_for_user_approval(session_id):
+                    break
+                continue
+            if process_pending_intervention(session_id):
                 continue
             if step_index >= len(steps):
                 break
             if CONTROL["stopped"]:
                 break
             while CONTROL["paused"] and not CONTROL["stopped"]:
-                if process_pending_intervention():
+                if process_pending_intervention(session_id):
                     continue
                 time.sleep(0.3)
             if CONTROL["stopped"]:
                 break
-            if process_pending_intervention():
+            if process_pending_intervention(session_id):
                 continue
 
             agent, phase, instruction, cli_mode = steps[step_index]
-            run_step(agent, phase, instruction, cli_mode)
+            succeeded = run_step(
+                agent,
+                phase,
+                instruction,
+                cli_mode,
+                expected_session_id=session_id,
+            )
+            if not succeeded:
+                with STATE_LOCK:
+                    if STATE.get("id") == session_id:
+                        CONTROL["paused"] = True
+                break
 
             with STATE_LOCK:
+                if STATE.get("id") != session_id:
+                    break
                 STATE["step_index"] += 1
                 save_state(STATE)
 
-            if phase == CONFIRM_PHASE and not CONTROL["stopped"]:
-                CONTROL["awaiting_approval"] = True
-                CONTROL["approval_deferred"] = False
-                with STATE_LOCK:
-                    CONTROL["approval_seen_messages"] = len(STATE["messages"])
-                separator("사용자 승인 대기 중 — 대시보드에서 승인해야 코딩이 진행됩니다")
-                while CONTROL["awaiting_approval"] and not CONTROL["stopped"]:
-                    with STATE_LOCK:
-                        message_count = len(STATE["messages"])
-                        last_message = STATE["messages"][-1] if STATE["messages"] else None
-                    if message_count > CONTROL["approval_seen_messages"]:
-                        CONTROL["approval_seen_messages"] = message_count
-                        if last_message and last_message.get("agent") == "user":
-                            CONTROL["approval_deferred"] = True
-                            process_pending_intervention()
-                            with STATE_LOCK:
-                                CONTROL["approval_seen_messages"] = len(STATE["messages"])
-                            separator("사용자 승인 대기 중 — 답변을 검토하고 승인/보류를 선택하세요")
-                    time.sleep(0.3)
+            if phase == CONFIRM_PHASE and not CONTROL["approval_requested"]:
+                mark_approval_requested(agent, phase)
+            if CONTROL["approval_requested"] and not wait_for_user_approval(session_id):
+                break
     finally:
         with STATE_LOCK:
-            mode = STATE.get("mode", "discussion")
-            enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
-            steps = steps_for_mode(mode, enabled_agents)
-            finished = STATE["step_index"] >= len(steps) and not CONTROL["stopped"]
-            STATE["finished"] = finished
-            save_state(STATE)
-            messages_copy = list(STATE["messages"])
-        render_html_snapshot()
-        if finished:
+            same_session = STATE.get("id") == session_id
+            finished = False
+            messages_copy = []
+            if same_session:
+                mode = STATE.get("mode", "discussion")
+                enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+                steps = steps_for_mode(mode, enabled_agents)
+                finished = STATE["step_index"] >= len(steps) and not CONTROL["stopped"]
+                STATE["finished"] = finished
+                STATE["active_agent"] = None
+                STATE["active_phase"] = None
+                STATE["active_started_at"] = None
+                STATE["active_cli_mode"] = None
+                STATE["active_prompt_chars"] = 0
+                save_state(STATE)
+                messages_copy = list(STATE["messages"])
+            if CONTROL.get("worker_session_id") == session_id:
+                CONTROL["worker_running"] = False
+                CONTROL["worker_session_id"] = None
+                restart_pending = CONTROL.get("worker_start_pending", False)
+                CONTROL["worker_start_pending"] = False
+        if same_session:
+            render_html_snapshot()
+        if same_session and finished:
             for agent in ("codex", "antigravity", "claude"):
                 update_profile(agent, messages_copy)
-        CONTROL["worker_running"] = False
         separator("워커 종료" if not finished else "완료")
+        if restart_pending:
+            start_worker_if_needed(force=True)
 
 
 def start_worker_if_needed(force: bool = False) -> None:
-    if CONTROL["worker_running"]:
-        return
-    CONTROL["worker_running"] = True
-    if force:
+    with STATE_LOCK:
+        session_id = STATE.get("id")
+        if CONTROL["worker_running"]:
+            if CONTROL.get("worker_session_id") != session_id:
+                CONTROL["worker_start_pending"] = True
+            return
+        CONTROL["worker_running"] = True
+        CONTROL["worker_session_id"] = session_id
+        CONTROL["worker_start_pending"] = False
         CONTROL["stopped"] = False
-    else:
-        CONTROL["stopped"] = False
-    thread = threading.Thread(target=worker_loop, daemon=True)
+    thread = threading.Thread(target=worker_loop, args=(session_id,), daemon=True)
     thread.start()
 
 
@@ -1410,7 +1736,7 @@ def state_json_payload() -> dict:
         active_cli_mode = STATE.get("active_cli_mode")
         active_prompt_chars = STATE.get("active_prompt_chars", 0)
         runtime_events = list(STATE.get("runtime_events", []))[-20:]
-    active_elapsed = round(time.time() - active_started_at, 1) if active_started_at else 0.0
+    active_elapsed = max(0.0, round(time.time() - active_started_at, 1)) if active_started_at else 0.0
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<div class="empty-state">아직 대화가 없습니다.</div>'
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
@@ -1423,6 +1749,9 @@ def state_json_payload() -> dict:
         "stopped": CONTROL["stopped"],
         "awaiting_approval": CONTROL["awaiting_approval"],
         "approval_deferred": CONTROL["approval_deferred"],
+        "approval_requested": CONTROL["approval_requested"],
+        "approval_requested_by": list(CONTROL["approval_requested_by"]),
+        "approval_rejected": CONTROL["approval_rejected"],
         "intervention_pending": CONTROL["intervention_pending"],
         "intervention_intent": CONTROL["intervention_intent"],
         "topic": html.escape(topic) if topic else "",
@@ -1538,12 +1867,26 @@ def switch_mode(mode: str) -> dict:
     if mode not in MODE_LABELS:
         return {"error": "알 수 없는 모드입니다."}
     with STATE_LOCK:
-        STATE["mode"] = mode
+        if STATE.get("active_agent"):
+            return {"error": "현재 모델 응답이 끝난 뒤 모드를 전환해주세요."}
+        previous_mode = STATE.get("mode", "discussion")
         enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+        common_step_count = len([step for step in DISCUSSION_STEPS if step[0] in enabled])
+        if previous_mode != mode:
+            if mode == "coding" and STATE.get("step_index", 0) >= common_step_count:
+                STATE["step_index"] = common_step_count
+            elif mode == "discussion" and STATE.get("step_index", 0) > common_step_count:
+                STATE["step_index"] = common_step_count
+        STATE["mode"] = mode
         step_count = len(steps_for_mode(mode, enabled))
-        if STATE.get("topic") and STATE.get("step_index", 0) < step_count:
-            STATE["finished"] = False
+        STATE["finished"] = bool(STATE.get("topic")) and STATE.get("step_index", 0) >= step_count
+        if not STATE["finished"]:
             CONTROL["stopped"] = False
+        CONTROL["awaiting_approval"] = False
+        CONTROL["approval_deferred"] = False
+        CONTROL["approval_requested"] = False
+        CONTROL["approval_requested_by"] = []
+        CONTROL["approval_rejected"] = False
         save_state(STATE)
         topic_exists = bool(STATE.get("topic"))
         should_start = topic_exists and not STATE.get("finished", False)
@@ -1609,13 +1952,17 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             stopped = CONTROL["stopped"]
             awaiting_approval = CONTROL["awaiting_approval"]
             approval_deferred = CONTROL["approval_deferred"]
+            approval_requested = CONTROL["approval_requested"]
+            approval_requested_by = tuple(CONTROL["approval_requested_by"])
+            approval_rejected = CONTROL["approval_rejected"]
             intervention_pending = CONTROL["intervention_pending"]
             intervention_intent = CONTROL["intervention_intent"]
             active_tick = int(time.time()) if active_agent else 0
             version_str = (
                 f"{messages_count}_{finished}_{total_est_tokens}_{total_elapsed_time}_"
                 f"{active_agent}_{active_phase}_{active_started_at}_{topic}_{mode}_{status}_{paused}_{stopped}_"
-                f"{awaiting_approval}_{approval_deferred}_{intervention_pending}_{intervention_intent}_"
+                f"{awaiting_approval}_{approval_deferred}_{approval_requested}_{approval_requested_by}_"
+                f"{approval_rejected}_{intervention_pending}_{intervention_intent}_"
                 f"{len(CONNECTION_STATUS)}_{active_tick}"
             )
             self._send_json({"version": version_str})
@@ -1697,6 +2044,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     STATE["topic"] = topic
                     STATE["mode"] = mode
                     STATE["enabled_agents"] = enabled_agents
+                    STATE["finished"] = False
+                    CONTROL["approval_requested"] = False
+                    CONTROL["approval_requested_by"] = []
+                    CONTROL["approval_rejected"] = False
                     save_state(STATE)
                     state_snapshot = dict(STATE)
                 start_log_session()
@@ -1733,11 +2084,15 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["paused"] = False
             CONTROL["awaiting_approval"] = False
             CONTROL["approval_deferred"] = False
+            CONTROL["approval_requested"] = False
+            CONTROL["approval_requested_by"] = []
+            CONTROL["approval_rejected"] = False
             CONTROL["approval_seen_messages"] = 0
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_seen_messages"] = 0
             CONTROL["intervention_queue"] = []
+            CONTROL["worker_start_pending"] = False
             CONTROL["stopped"] = True  # 혹시 워커가 돌고 있었다면 다음 체크포인트에서 멈추게
             self._send_html(render_dashboard())
             return
@@ -1746,10 +2101,14 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             form = self._read_form()
             text = form.get("text", [""])[0].strip()
             intent = form.get("intent", ["question"])[0].strip()
-            targets = normalize_target_agents(form.get("target", []))
+            requested_targets = form.get("target")
+            targets = normalize_target_agents(requested_targets)
             spec = INTERVENTION_INTENTS.get(intent, INTERVENTION_INTENTS["question"])
             if not text:
                 self._send_json({"error": "메시지 내용이 비어 있습니다."})
+                return
+            if intent != "note" and not targets:
+                self._send_json({"error": "활성 상태인 대상 모델을 하나 이상 선택해주세요."})
                 return
 
             try:
@@ -1784,13 +2143,17 @@ class RoundtableHandler(BaseHTTPRequestHandler):
 
         if self.path == "/resume":
             CONTROL["paused"] = False
+            start_worker_if_needed(force=True)
             self._send_json(state_json_payload())
             return
 
         if self.path == "/stop":
             CONTROL["stopped"] = True
             CONTROL["paused"] = False
+            CONTROL["awaiting_approval"] = False
             CONTROL["approval_deferred"] = False
+            CONTROL["approval_requested"] = False
+            CONTROL["approval_requested_by"] = []
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
@@ -1798,8 +2161,33 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/approve":
+            was_waiting = CONTROL["awaiting_approval"] or CONTROL["approval_requested"]
+            if was_waiting:
+                add_message("user", "승인", "승인")
+                add_runtime_event("사용자가 진행을 승인했습니다.")
             CONTROL["awaiting_approval"] = False
             CONTROL["approval_deferred"] = False
+            CONTROL["approval_requested"] = False
+            CONTROL["approval_requested_by"] = []
+            CONTROL["approval_rejected"] = False
+            CONTROL["intervention_pending"] = False
+            CONTROL["intervention_intent"] = ""
+            CONTROL["intervention_queue"] = []
+            self._send_json(state_json_payload())
+            return
+
+        if self.path == "/reject":
+            was_waiting = CONTROL["awaiting_approval"] or CONTROL["approval_requested"]
+            if was_waiting:
+                add_message("user", "승인 거절", "승인하지 않음")
+                add_runtime_event("사용자가 승인을 거절해 진행을 중단했습니다.")
+            CONTROL["awaiting_approval"] = False
+            CONTROL["approval_deferred"] = False
+            CONTROL["approval_requested"] = False
+            CONTROL["approval_requested_by"] = []
+            CONTROL["approval_rejected"] = True
+            CONTROL["stopped"] = True
+            CONTROL["paused"] = False
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []

@@ -1,0 +1,4 @@
+.agents/
+smoke_*.txt
+smoke_result.md
+server.*.log

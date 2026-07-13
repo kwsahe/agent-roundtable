@@ -51,7 +51,8 @@
     <section class="approve-banner" id="approveBanner" style="display:none">
       <p id="approveHint">위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
       <div class="approve-actions">
-        <button onclick="approveWork()"><svg viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>승인하고 코딩 진행</button>
+        <button onclick="approveWork()"><svg viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>승인하고 계속</button>
+        <button class="danger" onclick="rejectApproval()"><svg viewBox="0 0 24 24"><path d="M18.3 5.71L12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.71 2.88 18.3 9.17 12 2.88 5.7l1.41-1.41L10.59 10.6l6.3-6.31z"/></svg>승인하지 않음</button>
         <button class="ghost" onclick="deferApproval()"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>보류</button>
       </div>
       <div class="approval-input">

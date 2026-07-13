@@ -48,7 +48,7 @@ function renderSessionList(sessions, activeId) {
   }
   list.innerHTML = sessions.map((s) => {
     const cls = `session-item${s.id === (viewingId || activeId) ? " active" : ""}`;
-    const status = s.finished ? "완료" : (s.id === activeId ? "진행 중" : "보류");
+    const status = !s.topic ? "준비" : (s.finished ? "완료" : (s.id === activeId ? "진행 중" : "보류"));
     return `<button class="${cls}" onclick="viewSession('${s.id}')">
       <span class="s-topic">${escapeHtml(s.topic)}</span>
       <span class="s-meta">${status} · ${escapeHtml(s.mode_label)} · ${s.message_count}개</span>
@@ -75,6 +75,17 @@ function renderAgentStack(data) {
       <strong>${info.label}</strong><span>${escapeHtml(state)}</span>
     </div>`;
   }).join("");
+}
+
+function syncTargetControls(data) {
+  const enabled = new Set(data.enabled_agents || []);
+  ["interventionTarget", "approvalTarget"].forEach((name) => {
+    document.querySelectorAll(`input[name="${name}"]`).forEach((input) => {
+      const isEnabled = enabled.has(input.value);
+      input.disabled = !isEnabled;
+      if (!isEnabled) input.checked = false;
+    });
+  });
 }
 
 function renderRuntimeLog(events) {
@@ -286,9 +297,11 @@ function applyState(data) {
     lastState.showApprove = showApprove;
   }
 
+  const approvalRequesters = (data.approval_requested_by || []).join(", ");
+  const requesterLabel = approvalRequesters || "에이전트";
   const approveHintText = data.approval_deferred
-    ? "보류 중입니다. 질문/수정 요청을 보내면 확인 담당 에이전트가 다시 답합니다."
-    : "위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.";
+    ? `${requesterLabel}의 요청을 보류 중입니다. 질문이나 수정 요청을 보낼 수 있습니다.`
+    : `${requesterLabel}가 진행 승인을 요청했습니다. 승인 여부를 결정해주세요.`;
   if (lastState.approveHintText !== approveHintText) {
     $("approveHint").textContent = approveHintText;
     lastState.approveHintText = approveHintText;
@@ -296,6 +309,7 @@ function applyState(data) {
 
   updateInspector(data);
   updateThinking(data);
+  syncTargetControls(data);
 }
 
 async function loadSessions() {
@@ -376,6 +390,17 @@ async function approveWork() {
 async function deferApproval() {
   await fetch("/defer", { method: "POST" });
   await poll(true);
+}
+
+async function rejectApproval() {
+  try {
+    const response = await fetch("/reject", { method: "POST" });
+    if (!response.ok) throw new Error("서버 에러");
+  } catch (err) {
+    alert("승인 거절 처리에 실패했습니다: " + err.message);
+  } finally {
+    await poll(true);
+  }
 }
 
 async function submitTopic() {
