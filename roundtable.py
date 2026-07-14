@@ -36,10 +36,13 @@ Agent Roundtable — Codex, Antigravity & Claude Code
 """
 
 import html
+import inspect
+import difflib
 import json
 import locale
 import math
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -71,6 +74,33 @@ PROFILE_PATHS = {
     "antigravity": ROOT / "ANTIGRAVITY_Profile.md",
     "claude": ROOT / "CLAUDE_Profile.md",
 }
+
+ACTIVE_PROCESS_LOCK = threading.Lock()
+ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
+
+
+def cancel_active_cli_processes() -> list[str]:
+    cancelled = []
+    with ACTIVE_PROCESS_LOCK:
+        processes = list(ACTIVE_PROCESSES.items())
+    for tool_name, process in processes:
+        if process.poll() is not None:
+            continue
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            cancelled.append(tool_name)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    with ACTIVE_PROCESS_LOCK:
+        for tool_name, process in list(ACTIVE_PROCESSES.items()):
+            if process.poll() is not None:
+                ACTIVE_PROCESSES.pop(tool_name, None)
+    return cancelled
 
 SESSION_PROFILE_TEMPLATE = """# Session Role Profile
 
@@ -220,6 +250,12 @@ OUTPUT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_OUTPUT_MAX_CHARS", "2000"))
 PROJECT_SNAPSHOT_MAX_ENTRIES = int(os.environ.get("ROUNDTABLE_SNAPSHOT_MAX_ENTRIES", "20000"))
 
 APPROVAL_TOKEN = "APPROVE"
+MAX_DELEGATION_DEPTH = 2
+MAX_SESSION_DELEGATIONS = 12
+_AGENT_CALL_RE = re.compile(
+    r"^\s*CALL_AGENT:\s*(codex|antigravity|claude)\s*\|\s*(discussion|coding)\s*\|\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
 
 AGENTS = {
     "codex": {"label": "Codex", "color": "#4f8cff", "side": "left", "avatar": "/static/agents/codex.png"},
@@ -569,6 +605,169 @@ def compare_project_snapshots(before: dict[str, tuple], after: dict[str, tuple])
     return changes
 
 
+def capture_project_texts(root: Path, max_total_bytes: int = 5_000_000) -> dict[str, str]:
+    contents: dict[str, str] = {}
+    total = 0
+    skipped_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in skipped_dirs]
+        for name in files:
+            path = Path(current) / name
+            try:
+                size = path.stat().st_size
+                if size > 512_000 or total + size > max_total_bytes:
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            contents[path.relative_to(root).as_posix()] = text
+            total += size
+    return contents
+
+
+def build_turn_diff(root: Path, before: dict[str, str], changed_paths: list[dict]) -> str:
+    chunks = []
+    for item in changed_paths[:50]:
+        relative = item["path"].rstrip("/")
+        if not relative or item["path"].endswith("/"):
+            continue
+        path = root / relative
+        old_text = before.get(relative, "")
+        try:
+            new_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        except (OSError, UnicodeDecodeError):
+            continue
+        diff = difflib.unified_diff(
+            old_text.splitlines(), new_text.splitlines(),
+            fromfile=f"a/{relative}", tofile=f"b/{relative}", lineterm="",
+        )
+        chunk = "\n".join(diff)
+        if chunk:
+            chunks.append(chunk)
+    combined = "\n\n".join(chunks)
+    return (combined + "\n")[:100_000] if combined else ""
+
+
+def save_turn_checkpoint(session_id: str, step_index: int, agent: str, turn_diff: str) -> str:
+    if not turn_diff:
+        return ""
+    directory = session_memory_dir(session_id) / "checkpoints"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{step_index:03d}_{agent}.patch"
+    path.write_text(turn_diff, encoding="utf-8")
+    return str(path)
+
+
+def detect_validation_commands(root: Path) -> list[tuple[str, list[str]]]:
+    commands: list[tuple[str, list[str]]] = []
+    package_json = root / "package.json"
+    if package_json.exists():
+        try:
+            scripts = json.loads(package_json.read_text(encoding="utf-8")).get("scripts", {})
+        except (OSError, json.JSONDecodeError):
+            scripts = {}
+        npm = shutil.which("npm.cmd") or shutil.which("npm") or "npm"
+        if scripts.get("test") and "no test specified" not in scripts["test"]:
+            commands.append(("npm test", [npm, "test", "--", "--runInBand"]))
+        if scripts.get("build"):
+            commands.append(("npm run build", [npm, "run", "build"]))
+    if (root / "tests").is_dir() and any((root / "tests").glob("test*.py")):
+        commands.append(("Python unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]))
+    return commands[:2]
+
+
+def run_project_validation(root: Path) -> list[dict]:
+    results = []
+    for label, command in detect_validation_commands(root):
+        started = time.time()
+        try:
+            result = subprocess.run(command, cwd=root, capture_output=True, timeout=180)
+            output = decode_cli_output(result.stdout or result.stderr).strip()
+            results.append({
+                "label": label,
+                "ok": result.returncode == 0,
+                "returncode": result.returncode,
+                "elapsed": round(time.time() - started, 1),
+                "output": output[-2000:],
+            })
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"label": label, "ok": False, "returncode": -1, "elapsed": round(time.time() - started, 1), "output": str(exc)})
+    return results
+
+
+def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str | None]:
+    """CLI JSONL 한 줄을 대시보드용 진행 이벤트와 최종 답변으로 변환한다."""
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        if tool_name == "Antigravity" and line.strip():
+            return {"kind": "log", "text": line.strip()[:240]}, None
+        return None, None
+
+    if tool_name == "Codex":
+        event_type = data.get("type", "")
+        item = data.get("item") or {}
+        item_type = item.get("type", "")
+        if event_type == "thread.started":
+            return {"kind": "status", "text": "Codex 세션 시작"}, None
+        if event_type == "turn.started":
+            return {"kind": "thinking", "text": "요청 분석 및 작업 계획 수립 중"}, None
+        if item_type == "reasoning":
+            return {"kind": "thinking", "text": "추론 중"}, None
+        if item_type == "command_execution":
+            command = item.get("command") or item.get("text") or "명령 실행"
+            status = item.get("status", "started")
+            return {"kind": "command", "text": f"{status}: {command}"[:300]}, None
+        if item_type == "file_change":
+            changes = item.get("changes") or []
+            paths = [change.get("path", "") for change in changes if isinstance(change, dict)]
+            return {"kind": "file", "text": "파일 변경", "paths": paths[:20]}, None
+        if item_type in {"mcp_tool_call", "web_search"}:
+            name = item.get("server") or item.get("name") or item_type
+            return {"kind": "tool", "text": f"도구 실행: {name}"}, None
+        if item_type == "agent_message":
+            text = item.get("text", "")
+            return {"kind": "message", "text": "최종 답변 작성 완료"}, text or None
+        if event_type == "turn.completed" and data.get("usage"):
+            return {"kind": "usage", "text": "사용량 집계", "usage": data["usage"]}, None
+
+    if tool_name == "Claude Code":
+        event_type = data.get("type", "")
+        if event_type == "system" and data.get("subtype") == "init":
+            return {"kind": "status", "text": "Claude 세션 및 도구 초기화"}, None
+        if event_type == "assistant":
+            message = data.get("message") or {}
+            usage = message.get("usage")
+            for block in message.get("content") or []:
+                block_type = block.get("type")
+                if block_type == "tool_use":
+                    name = block.get("name", "도구")
+                    tool_input = block.get("input") or {}
+                    path = tool_input.get("file_path") or tool_input.get("path")
+                    detail = f": {path}" if path else ""
+                    kind = "file" if name in {"Edit", "Write", "NotebookEdit"} else "tool"
+                    event = {"kind": kind, "text": f"{name} 실행{detail}"[:300], "usage": usage}
+                    if path:
+                        event["paths"] = [path]
+                    return event, None
+                if block_type == "thinking":
+                    return {"kind": "thinking", "text": "추론 중", "usage": usage}, None
+            if usage:
+                return {"kind": "usage", "text": "Claude 사용량 갱신", "usage": usage}, None
+        if event_type == "user":
+            return {"kind": "tool", "text": "도구 실행 결과 확인"}, None
+        if event_type == "result":
+            usage = data.get("usage") or {}
+            event = {
+                "kind": "usage",
+                "text": "Claude 응답 및 사용량 집계 완료",
+                "usage": usage,
+                "cost_usd": data.get("total_cost_usd"),
+            }
+            return event, data.get("result") or None
+    return None, None
+
+
 def run_cli(
     tool_name: str,
     command: str,
@@ -577,9 +776,71 @@ def run_cli(
     timeout: int | None = None,
     cwd: Path | None = None,
     input_text: str | None = None,
+    stream_events: bool = False,
+    event_callback=None,
 ):
     cmd = resolve_command(command) + args
     try:
+        if stream_events:
+            process = subprocess.Popen(
+                cmd,
+                cwd=cwd or ROOT,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            with ACTIVE_PROCESS_LOCK:
+                ACTIVE_PROCESSES[tool_name] = process
+            if input_text is not None and process.stdin is not None:
+                process.stdin.write(input_text.encode("utf-8"))
+                process.stdin.close()
+
+            output_queue: queue.Queue = queue.Queue()
+
+            def read_stream(name: str, stream) -> None:
+                for raw_line in iter(stream.readline, b""):
+                    output_queue.put((name, raw_line))
+                output_queue.put((name, None))
+
+            threads = [
+                threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+                threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
+            final_messages: list[str] = []
+            closed_streams = 0
+            deadline = time.monotonic() + timeout if timeout else None
+            while closed_streams < 2:
+                if deadline and time.monotonic() >= deadline:
+                    process.kill()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    stream_name, raw_line = output_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if raw_line is None:
+                    closed_streams += 1
+                    continue
+                line = decode_cli_output(raw_line).rstrip("\r\n")
+                target = stdout_lines if stream_name == "stdout" else stderr_lines
+                target.append(line)
+                if stream_name == "stdout":
+                    event, final_text = parse_cli_stream_event(tool_name, line)
+                    if event and event_callback:
+                        event_callback(event)
+                    if final_text:
+                        final_messages.append(final_text)
+            returncode = process.wait()
+            with ACTIVE_PROCESS_LOCK:
+                if ACTIVE_PROCESSES.get(tool_name) is process:
+                    ACTIVE_PROCESSES.pop(tool_name, None)
+            stdout = "\n".join(final_messages) if final_messages else "\n".join(stdout_lines)
+            return subprocess.CompletedProcess(cmd, returncode, stdout, "\n".join(stderr_lines))
+
         result = subprocess.run(
             cmd,
             cwd=cwd or ROOT,
@@ -598,6 +859,10 @@ def run_cli(
     except PermissionError as exc:
         print_cli_hint(tool_name, command, f"권한 거부 ({exc})")
     except subprocess.TimeoutExpired:
+        with ACTIVE_PROCESS_LOCK:
+            active = ACTIVE_PROCESSES.get(tool_name)
+            if active is not None and active.poll() is not None:
+                ACTIVE_PROCESSES.pop(tool_name, None)
         print_cli_hint(tool_name, command, "실행 시간 초과")
     return None
 
@@ -658,15 +923,27 @@ def _finalize_cli_result(tool_name: str, result) -> str:
     return text
 
 
-def ask_codex(prompt: str, mode: str = "discussion") -> str:
+_INCOMPLETE_TOOL_RESPONSE_RE = re.compile(
+    r"(?:\*\*)?Tool:\s*[\w.-]+(?:\*\*)?\s*$|<tool(?:_use)?[\s>]",
+    re.IGNORECASE,
+)
+
+
+def is_incomplete_tool_response(text: str) -> bool:
+    return bool(_INCOMPLETE_TOOL_RESPONSE_RE.search(text.strip()))
+
+
+def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str:
     sandbox = "workspace-write" if mode == "coding" else "read-only"
     setting = selected_agent_setting("codex")
-    args = ["exec"]
+    args = ["exec", "--ephemeral", "--ignore-user-config"]
+    if mode == "discussion":
+        args.append("--ignore-rules")
     if setting["model"]:
         args.extend(["--model", setting["model"]])
     if setting["effort"]:
         args.extend(["--config", f'model_reasoning_effort="{setting["effort"]}"'])
-    args.extend(["--sandbox", sandbox, "--skip-git-repo-check", "-"])
+    args.extend(["--sandbox", sandbox, "--skip-git-repo-check", "--json", "-"])
     result = run_cli(
         "Codex",
         CODEX_CMD,
@@ -674,30 +951,64 @@ def ask_codex(prompt: str, mode: str = "discussion") -> str:
         timeout=CODEX_TIMEOUT,
         cwd=load_project_path(),
         input_text=prompt,
+        stream_events=True,
+        event_callback=event_callback,
     )
     return _finalize_cli_result("Codex", result)
 
 
-def ask_claude(prompt: str, mode: str = "discussion") -> str:
-    permission_mode = "acceptEdits" if mode == "coding" else "plan"
+def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> str:
+    permission_mode = "acceptEdits" if mode == "coding" else "dontAsk"
     setting = selected_agent_setting("claude")
-    args = ["--print"]
+    args = ["--print", "--safe-mode", "--no-session-persistence"]
     if setting["model"]:
         args.extend(["--model", setting["model"]])
     if setting["effort"]:
         args.extend(["--effort", setting["effort"]])
-    args.extend(["--permission-mode", permission_mode, prompt])
+    state = globals().get("STATE", {})
+    budget = state.get("budget") or {}
+    cost_limit = float(budget.get("cost_limit_usd", 0.0) or 0.0)
+    if cost_limit:
+        remaining = max(0.01, cost_limit - float(state.get("total_actual_cost_usd", 0.0) or 0.0))
+        args.extend(["--max-budget-usd", f"{remaining:.4f}"])
+    if mode == "discussion":
+        args.extend(["--tools", ""])
+        args.extend([
+            "--system-prompt",
+            "You are the Claude participant in a controlled roundtable. Never call, request, or announce tools. "
+            "Do not inspect files, enter plan mode, mention plan files, or request ExitPlanMode. "
+            "Return only a complete final answer in Korean, with no Tool: markers.",
+        ])
+    else:
+        args.extend(["--tools", "Bash,Edit,Read,Write,Glob,Grep"])
+    args.extend(["--permission-mode", permission_mode, "--verbose", "--output-format", "stream-json", prompt])
     result = run_cli(
         "Claude Code",
         CLAUDE_CMD,
         args,
         timeout=CLAUDE_TIMEOUT,
         cwd=load_project_path(),
+        stream_events=True,
+        event_callback=event_callback,
     )
-    return _finalize_cli_result("Claude Code", result)
+    text = _finalize_cli_result("Claude Code", result)
+    if mode == "discussion" and is_incomplete_tool_response(text):
+        if event_callback:
+            event_callback({"kind": "status", "text": "불완전한 도구 요청 응답 감지 · 자동 교정 재시도"})
+        retry_args = list(args)
+        retry_args[-1] = (
+            "이전 응답이 Tool 요청에서 중단되었다. 도구를 절대 호출하거나 언급하지 말고, "
+            "이미 제공된 프롬프트 정보만으로 완결된 최종 답변을 한국어로 작성해라.\n\n" + prompt
+        )
+        retry_result = run_cli(
+            "Claude Code", CLAUDE_CMD, retry_args, timeout=CLAUDE_TIMEOUT,
+            cwd=load_project_path(), stream_events=True, event_callback=event_callback,
+        )
+        text = _finalize_cli_result("Claude Code", retry_result)
+    return text
 
 
-def ask_antigravity(prompt: str, mode: str = "discussion") -> str:
+def ask_antigravity(prompt: str, mode: str = "discussion", event_callback=None) -> str:
     # agy는 Go 스타일 플래그라 --print 자체가 프롬프트 값을 먹는다. 반드시 마지막에 와야 함.
     # subprocess의 cwd만으로는 agy가 프로젝트 폴더를 인식하지 못하고 자기 내부의 기본
     # scratch 워크스페이스를 본다 — --add-dir로 명시적으로 작업 폴더를 알려줘야 한다.
@@ -710,7 +1021,10 @@ def ask_antigravity(prompt: str, mode: str = "discussion") -> str:
         args = base_args + ["--mode", "accept-edits", "--print", prompt]
     else:
         args = base_args + ["--mode", "plan", "--sandbox", "--print", prompt]
-    result = run_cli("Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=project_path)
+    result = run_cli(
+        "Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=project_path,
+        stream_events=True, event_callback=event_callback,
+    )
     return _finalize_cli_result("Antigravity", result)
 
 
@@ -733,6 +1047,10 @@ def new_state() -> dict:
     return {
         "id": new_session_id(),
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "name": "새 세션",
+        "tags": [],
+        "favorite": False,
+        "archived": False,
         "messages": [],
         "step_index": 0,
         "finished": False,
@@ -741,32 +1059,58 @@ def new_state() -> dict:
         "enabled_agents": list(AGENT_ORDER),
         "agent_settings": normalize_agent_settings(None),
         "total_est_tokens": 0,
+        "total_actual_tokens": 0,
+        "total_actual_cost_usd": 0.0,
+        "budget": {"token_limit": 0, "cost_limit_usd": 0.0},
         "total_elapsed_time": 0.0,
         "active_agent": None,
         "active_phase": None,
         "active_started_at": None,
         "active_cli_mode": None,
         "active_prompt_chars": 0,
+        "active_work_log": [],
+        "active_usage": {},
         "runtime_events": [],
+        "validation_results": [],
+        "delegation_count": 0,
+        "delegation_history": [],
     }
 
 
 def normalize_state(state: dict) -> dict:
     state.setdefault("id", new_session_id())
     state.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+    state.setdefault("name", state.get("topic") or "새 세션")
+    state.setdefault("tags", [])
+    state.setdefault("favorite", False)
+    state.setdefault("archived", False)
+    state["tags"] = [str(tag).strip()[:24] for tag in state["tags"] if str(tag).strip()][:8]
     state.setdefault("messages", [])
     state.setdefault("step_index", 0)
     state.setdefault("finished", False)
     state.setdefault("topic", "")
     state.setdefault("mode", "discussion")
     state.setdefault("total_est_tokens", 0)
+    state.setdefault("total_actual_tokens", 0)
+    state.setdefault("total_actual_cost_usd", 0.0)
+    state.setdefault("budget", {"token_limit": 0, "cost_limit_usd": 0.0})
+    budget = state["budget"] if isinstance(state["budget"], dict) else {}
+    state["budget"] = {
+        "token_limit": max(0, int(budget.get("token_limit", 0) or 0)),
+        "cost_limit_usd": max(0.0, float(budget.get("cost_limit_usd", 0.0) or 0.0)),
+    }
     state.setdefault("total_elapsed_time", 0.0)
     state.setdefault("active_agent", None)
     state.setdefault("active_phase", None)
     state.setdefault("active_started_at", None)
     state.setdefault("active_cli_mode", None)
     state.setdefault("active_prompt_chars", 0)
+    state.setdefault("active_work_log", [])
+    state.setdefault("active_usage", {})
     state.setdefault("runtime_events", [])
+    state.setdefault("validation_results", [])
+    state.setdefault("delegation_count", 0)
+    state.setdefault("delegation_history", [])
     state["enabled_agents"] = normalize_enabled_agents(state.get("enabled_agents"))
     state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
     return state
@@ -782,6 +1126,8 @@ def load_state() -> dict:
             state["active_started_at"] = None
             state["active_cli_mode"] = None
             state["active_prompt_chars"] = 0
+            state["active_work_log"] = []
+            state["active_usage"] = {}
             return state
         except json.JSONDecodeError:
             pass
@@ -809,6 +1155,10 @@ def list_sessions() -> list[dict]:
         summaries.append({
             "id": data.get("id", path.stem),
             "topic": data.get("topic", ""),
+            "name": data.get("name") or data.get("topic") or "새 세션",
+            "tags": data.get("tags", []),
+            "favorite": bool(data.get("favorite", False)),
+            "archived": bool(data.get("archived", False)),
             "mode": data.get("mode", "discussion"),
             "enabled_agents": normalize_enabled_agents(data.get("enabled_agents")),
             "agent_settings": normalize_agent_settings(data.get("agent_settings")),
@@ -1022,6 +1372,35 @@ def build_transcript(messages: list[dict], window: int | None = None) -> str:
     return transcript
 
 
+def select_shared_messages(messages: list[dict], enabled_agents: list[str]) -> list[dict]:
+    """각 활성 모델의 최신 발언과 사용자의 최신 개입을 한 번씩 고른다."""
+    wanted = set(normalize_enabled_agents(enabled_agents)) | {"user"}
+    selected: list[tuple[int, dict]] = []
+    seen: set[str] = set()
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        agent = message.get("agent")
+        if agent not in wanted or agent in seen:
+            continue
+        selected.append((index, message))
+        seen.add(agent)
+        if seen == wanted:
+            break
+    selected.sort(key=lambda item: item[0])
+    return [message for _index, message in selected]
+
+
+def build_shared_transcript(messages: list[dict], enabled_agents: list[str]) -> tuple[str, list[dict]]:
+    selected = select_shared_messages(messages, enabled_agents)
+    compact = []
+    for message in selected:
+        text = message.get("text", "")
+        if len(text) > 320:
+            text = text[:155] + "\n... (발언 축약) ...\n" + text[-145:]
+        compact.append({**message, "text": text})
+    return build_transcript(compact), selected
+
+
 def read_brief_tail(session_id: str, max_lines: int = MEMORY_BRIEF_LINES) -> str:
     _full_path, brief_path = session_memory_paths(session_id)
     if not brief_path.exists():
@@ -1086,6 +1465,26 @@ def extract_approval_token(text: str) -> tuple[str, bool]:
     return text, False
 
 
+def extract_agent_calls(text: str, source_agent: str, current_cli_mode: str) -> tuple[str, list[dict]]:
+    calls = []
+    kept_lines = []
+    seen = set()
+    for line in text.splitlines():
+        match = _AGENT_CALL_RE.match(line)
+        if not match:
+            kept_lines.append(line)
+            continue
+        target, requested_mode, task = match.groups()
+        target = target.lower()
+        task = task.strip()[:600]
+        if target == source_agent or not task or target in seen or len(calls) >= 2:
+            continue
+        mode = "coding" if requested_mode.lower() == "coding" and current_cli_mode == "coding" else "discussion"
+        calls.append({"target": target, "mode": mode, "task": task})
+        seen.add(target)
+    return "\n".join(kept_lines).rstrip(), calls
+
+
 def compose_agent_prompt(
     team_prompt: str,
     topic: str,
@@ -1099,6 +1498,9 @@ def compose_agent_prompt(
     header = (
         "모든 사용자 노출 문장은 한국어로 쓴다. 파일명·명령어·코드 식별자만 원문을 유지한다.\n"
         "도구 실행 계획과 탐색 과정을 출력하지 말고 결론만 최대 6개 항목, 1,200자 이내로 답한다.\n"
+        "다른 에이전트의 전문성이 꼭 필요하면 답변 마지막에 최대 2개까지 "
+        "CALL_AGENT: codex|antigravity|claude | discussion|coding | 구체적인 요청 형식으로 쓴다. "
+        "직접 해결할 수 있으면 호출하지 않는다. 자신은 호출하지 않는다.\n"
         f"사용자 승인이 꼭 필요하면 설명을 마친 뒤 마지막 줄에 {APPROVAL_TOKEN}만 쓴다. "
         f"승인이 필요하지 않으면 {APPROVAL_TOKEN}를 쓰지 않는다.\n\n"
     )
@@ -1181,6 +1583,31 @@ def add_runtime_event(text: str, level: str = "info") -> None:
         events.append(event)
         del events[:-80]
         save_state(STATE)
+
+
+def add_active_work_event(agent: str, event: dict) -> None:
+    """실행 중인 CLI 이벤트를 짧게 정리해 상태에 보관한다."""
+    with STATE_LOCK:
+        if STATE.get("active_agent") != agent:
+            return
+        usage = event.get("usage")
+        if isinstance(usage, dict) and usage:
+            STATE["active_usage"] = usage
+        entry = {
+            "time": ts(),
+            "kind": event.get("kind", "log"),
+            "text": str(event.get("text", "작업 중"))[:300],
+        }
+        if event.get("paths"):
+            entry["paths"] = [str(path)[:240] for path in event["paths"][:20]]
+        if event.get("cost_usd") is not None:
+            entry["cost_usd"] = event["cost_usd"]
+        logs = STATE.setdefault("active_work_log", [])
+        if logs and logs[-1].get("kind") == entry["kind"] and logs[-1].get("text") == entry["text"]:
+            logs[-1].update(entry)
+        else:
+            logs.append(entry)
+            del logs[:-40]
 
 
 def mark_approval_requested(agent: str, phase: str) -> None:
@@ -1267,6 +1694,7 @@ def bubble_html(m: dict) -> str:
 
     meta = m.get("meta")
     stats_html = ""
+    work_html = ""
     if meta:
         changed_paths = meta.get("changed_paths", [])
         changes_html = f' · 파일 변경 {len(changed_paths)}개' if meta.get("cli_mode") == "coding" else ""
@@ -1276,6 +1704,48 @@ def bubble_html(m: dict) -> str:
             f'입력 {meta["prompt_chars"]}자/출력 {meta["output_chars"]}자 · '
             f'{html.escape(meta["cli_mode"])}{changes_html}</div>'
         )
+        work_log = meta.get("work_log", [])
+        if work_log:
+            entries = []
+            for event in work_log[-20:]:
+                paths = event.get("paths") or []
+                path_html = "".join(f'<code>{html.escape(path)}</code>' for path in paths[:10])
+                entries.append(
+                    f'<li class="work-{html.escape(event.get("kind", "log"))}">'
+                    f'<span>{html.escape(event.get("time", ""))}</span>'
+                    f'<p>{html.escape(event.get("text", ""))}</p>{path_html}</li>'
+                )
+            work_html = (
+                f'<details class="turn-work-log"><summary>작업 로그 {len(work_log)}개</summary>'
+                f'<ol>{"".join(entries)}</ol></details>'
+            )
+        shared_context = meta.get("shared_context", [])
+        if shared_context:
+            labels = ", ".join(
+                f'{item.get("label", "모델")} · {item.get("phase", "대화")}' for item in shared_context
+            )
+            work_html += f'<div class="context-proof">전달받은 최근 대화: {html.escape(labels)}</div>'
+        if meta.get("turn_diff"):
+            checkpoint = html.escape(meta.get("checkpoint_path", ""))
+            file_choices = "".join(
+                f'<label><input type="checkbox" value="{html.escape(item["path"])}">'
+                f'{html.escape(item["change"])} {html.escape(item["path"])}</label>'
+                for item in meta.get("changed_paths", []) if not item["path"].endswith("/")
+            )
+        if meta.get("agent_calls"):
+            calls_html = "".join(
+                f'<li><strong>{html.escape(AGENTS.get(call["target"], {}).get("label", call["target"]))}</strong>'
+                f' · {html.escape(call["mode"])} · {html.escape(call["task"])}</li>'
+                for call in meta["agent_calls"]
+            )
+            work_html += f'<div class="agent-calls"><span>후속 에이전트 호출</span><ul>{calls_html}</ul></div>'
+            work_html += (
+                f'<details class="turn-diff"><summary>코드 변경 Diff</summary>'
+                f'<p>{checkpoint}</p><pre>{html.escape(meta["turn_diff"])}</pre>'
+                f'<div class="file-review" data-checkpoint="{checkpoint}">{file_choices}'
+                f'<button class="danger compact" onclick="rollbackSelectedFiles(this)">선택 변경 되돌리기</button>'
+                f'</div></details>'
+            )
 
     return f"""
     <div class="row {side}{highlight_class}">
@@ -1288,6 +1758,7 @@ def bubble_html(m: dict) -> str:
         </div>
         <div class="text">{render_text_html(m['text'])}</div>
         {stats_html}
+        {work_html}
       </div>
     </div>"""
 
@@ -1322,6 +1793,34 @@ def render_html_snapshot() -> None:
     HTML_PATH.write_text(render_dashboard(), encoding="utf-8")
 
 
+def actual_token_count(usage: dict | None) -> int:
+    usage = usage or {}
+    # OpenAI input_tokens already includes cached_input_tokens; Anthropic cache fields are separate.
+    return sum(int(usage.get(key, 0) or 0) for key in (
+        "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"
+    ))
+
+
+def budget_exceeded_reason(state: dict) -> str | None:
+    budget = state.get("budget") or {}
+    token_limit = int(budget.get("token_limit", 0) or 0)
+    cost_limit = float(budget.get("cost_limit_usd", 0.0) or 0.0)
+    if token_limit and int(state.get("total_actual_tokens", 0) or 0) >= token_limit:
+        return f"실제 토큰 예산 {token_limit:,}개에 도달했습니다."
+    if cost_limit and float(state.get("total_actual_cost_usd", 0.0) or 0.0) >= cost_limit:
+        return f"비용 예산 ${cost_limit:.2f}에 도달했습니다."
+    return None
+
+
+def budget_block_message(reason: str) -> str:
+    return (
+        f"요청을 실행하지 않았습니다. {reason}\n\n"
+        "오른쪽 Usage에서 Token limit을 현재 누적 사용량보다 크게 설정하거나, "
+        "0으로 설정해 제한을 해제해주세요. 보류된 요청은 저장 후 자동으로 재개되며, "
+        "전송 전에 차단된 요청은 입력창에서 다시 보내면 됩니다."
+    )
+
+
 def add_message(
     agent: str,
     phase: str,
@@ -1337,6 +1836,13 @@ def add_message(
             message["meta"] = meta
             STATE["total_est_tokens"] = STATE.get("total_est_tokens", 0) + meta.get("est_tokens", 0)
             STATE["total_elapsed_time"] = STATE.get("total_elapsed_time", 0.0) + meta.get("elapsed", 0.0)
+            STATE["total_actual_tokens"] = STATE.get("total_actual_tokens", 0) + actual_token_count(
+                meta.get("actual_usage")
+            )
+            STATE["total_actual_cost_usd"] = round(
+                STATE.get("total_actual_cost_usd", 0.0) + float(meta.get("actual_cost_usd", 0.0) or 0.0),
+                6,
+            )
         STATE["messages"].append(message)
         save_state(STATE)
         session_id = STATE["id"]
@@ -1366,6 +1872,22 @@ INTERVENTION_INTENTS = {
             "팀장(사용자)이 진행 방향을 수정했다. 이 지시를 기존 계획보다 우선해서 반영하고, "
             "앞으로 어떤 단계/역할/작업이 달라지는지 정리해라. 아직 실제로 파일을 수정하지 마."
         ),
+        "pause_after": False,
+    },
+    "execute": {
+        "label": "코딩 실행",
+        "phase": "사용자 개입 · 코딩 실행",
+        "instruction": (
+            "팀장(사용자)이 실제 구현을 명시적으로 지시했다. 계획이나 착수 보고만 작성하지 말고, "
+            "현재 프로젝트 파일을 직접 확인하고 담당 범위의 코드를 실제로 수정해라. 변경 후 가능한 검증을 실행하고, "
+            "완료된 파일과 검증 결과만 간결하게 보고해라. 다른 에이전트 담당 파일은 수정하지 마."
+        ),
+        "pause_after": False,
+    },
+    "delegation": {
+        "label": "에이전트 호출",
+        "phase": "에이전트 호출 답변",
+        "instruction": "다른 에이전트가 전문 검토나 후속 작업을 요청했다. 요청 범위만 실제로 처리하고 결과를 호출한 에이전트와 팀장에게 간결하게 보고해라.",
         "pause_after": False,
     },
     "hold": {
@@ -1403,7 +1925,7 @@ def normalize_target_agents(targets: list[str] | None) -> list[str]:
     return [agent for agent in targets if agent in enabled]
 
 
-def mark_intervention(intent: str, targets: list[str] | None = None) -> None:
+def mark_intervention(intent: str, targets: list[str] | None = None, cli_mode: str = "discussion") -> None:
     intent = intent if intent in INTERVENTION_INTENTS else "question"
     if intent == "note":
         return
@@ -1415,7 +1937,51 @@ def mark_intervention(intent: str, targets: list[str] | None = None) -> None:
         CONTROL["intervention_queue"].append({
             "intent": intent,
             "targets": target_agents,
+            "cli_mode": "coding" if cli_mode == "coding" else "discussion",
         })
+
+
+def queue_agent_calls(source_agent: str, calls: list[dict], depth: int) -> list[dict]:
+    queued = []
+    if depth >= MAX_DELEGATION_DEPTH:
+        return queued
+    with STATE_LOCK:
+        enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+        count = int(STATE.get("delegation_count", 0))
+        for call in calls:
+            target = call.get("target")
+            if target not in enabled or target == source_agent or count >= MAX_SESSION_DELEGATIONS:
+                continue
+            entry = {
+                "source": source_agent,
+                "target": target,
+                "mode": call.get("mode", "discussion"),
+                "task": str(call.get("task", ""))[:600],
+                "depth": depth + 1,
+                "time": ts(),
+            }
+            CONTROL["intervention_queue"].append({
+                "intent": "delegation",
+                "targets": [target],
+                "cli_mode": entry["mode"],
+                "custom_instruction": entry["task"],
+                "source_agent": source_agent,
+                "delegation_depth": depth + 1,
+            })
+            STATE.setdefault("delegation_history", []).append(entry)
+            del STATE["delegation_history"][:-40]
+            count += 1
+            queued.append(entry)
+        STATE["delegation_count"] = count
+        CONTROL["intervention_pending"] = bool(CONTROL["intervention_queue"])
+        if queued:
+            save_state(STATE)
+    for entry in queued:
+        add_runtime_event(
+            f'{AGENTS[source_agent]["label"]} → {AGENTS[entry["target"]]["label"]} 호출 '
+            f'({entry["mode"]}): {entry["task"][:160]}'
+        )
+    return queued
 
 
 def process_pending_intervention(expected_session_id: str | None = None) -> bool:
@@ -1431,23 +1997,35 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
     if not item:
         return False
     intent = item["intent"] if item["intent"] in INTERVENTION_INTENTS else "question"
+    cli_mode = "coding" if item.get("cli_mode") == "coding" else "discussion"
     spec = INTERVENTION_INTENTS[intent]
     targets = normalize_target_agents(item.get("targets"))
-    add_runtime_event(f"사용자 개입 처리 시작: {spec['label']} → {agent_names(targets)}")
+    source_agent = item.get("source_agent")
+    source_label = AGENTS.get(source_agent, {}).get("label", "사용자")
+    event_prefix = f"{source_label} 호출" if intent == "delegation" else "사용자 개입"
+    add_runtime_event(f"{event_prefix} 처리 시작: {spec['label']} → {agent_names(targets)}")
     for responder in targets:
+        custom_instruction = item.get("custom_instruction", "")
         target_instruction = (
             f"{spec['instruction']}\n\n"
+            f'{f"호출한 에이전트: {source_label}. 요청 내용: {custom_instruction}" if custom_instruction else ""}\n'
             f"이번 개입의 직접 대상 모델: {agent_names(targets)}.\n"
-            f"너({AGENTS[responder]['label']})에게 직접 질문/지시가 왔다고 보고 답해라."
+            f"너({AGENTS[responder]['label']})에게 직접 질문/지시가 왔다고 보고 "
+            f'{"실제 파일을 수정하고 결과를 보고해라." if cli_mode == "coding" else "답해라."}'
         )
         if not run_step(
             responder,
-            "개입 답변",
+            f"호출 답변 · {source_label}" if intent == "delegation" else "개입 답변",
             target_instruction,
-            "discussion",
+            cli_mode,
             expected_session_id=expected_session_id,
+            delegation_depth=int(item.get("delegation_depth", 0)),
         ):
-            CONTROL["paused"] = True
+            with STATE_LOCK:
+                CONTROL["intervention_queue"].insert(0, item)
+                CONTROL["intervention_pending"] = True
+                CONTROL["intervention_intent"] = item["intent"]
+                CONTROL["paused"] = True
             return True
     with STATE_LOCK:
         CONTROL["intervention_seen_messages"] = len(STATE["messages"])
@@ -1493,7 +2071,7 @@ def estimate_tokens(*texts: str) -> int:
 
 
 def is_cli_failure(text: str) -> bool:
-    return "응답 없음" in text or "빈 응답" in text
+    return "응답 없음" in text or "빈 응답" in text or is_incomplete_tool_response(text)
 
 
 def run_step(
@@ -1503,16 +2081,46 @@ def run_step(
     cli_mode: str,
     *,
     expected_session_id: str | None = None,
+    delegation_depth: int = 0,
 ) -> bool:
     label = AGENTS[agent]["label"]
     separator(f"{label} — {phase}")
+    with STATE_LOCK:
+        budget_reason = budget_exceeded_reason(STATE)
+    if budget_reason:
+        CONTROL["paused"] = True
+        add_runtime_event(f"예산 초과로 자동 일시정지: {budget_reason}", level="error")
+        add_message(
+            agent,
+            "실행 차단 · 예산 한도",
+            budget_block_message(budget_reason),
+            {
+                "elapsed": 0.0,
+                "est_tokens": 0,
+                "cli_mode": cli_mode,
+                "prompt_chars": 0,
+                "output_chars": 0,
+                "raw_output_chars": 0,
+                "output_truncated": False,
+                "approval_requested": False,
+                "ok": False,
+                "failure_kind": "budget",
+                "changed_paths": [],
+                "snapshot_truncated": False,
+            },
+            expected_session_id=expected_session_id,
+        )
+        return False
     with STATE_LOCK:
         if expected_session_id and STATE.get("id") != expected_session_id:
             return False
         session_id = STATE.get("id")
         state_snapshot = dict(STATE)
         topic = STATE.get("topic", "").strip()
-        transcript = build_transcript(STATE["messages"], window=TRANSCRIPT_WINDOW)
+        transcript, shared_messages = build_shared_transcript(
+            STATE["messages"],
+            normalize_enabled_agents(STATE.get("enabled_agents")),
+        )
     memory_context = build_memory_context(state_snapshot)
     team_prompt = load_team_prompt()
     prompt = compose_agent_prompt(team_prompt, topic, memory_context, transcript, instruction)
@@ -1525,7 +2133,16 @@ def run_step(
         STATE["active_started_at"] = time.time()
         STATE["active_cli_mode"] = cli_mode
         STATE["active_prompt_chars"] = len(prompt)
+        STATE["active_work_log"] = []
+        STATE["active_usage"] = {}
         save_state(STATE)
+    add_active_work_event(agent, {"kind": "status", "text": "CLI 프로세스 시작"})
+    if shared_messages:
+        shared_labels = [AGENTS.get(message.get("agent"), {}).get("label", "사용자") for message in shared_messages]
+        add_active_work_event(
+            agent,
+            {"kind": "context", "text": f"최근 대화 {len(shared_messages)}개 공유: {', '.join(shared_labels)}"},
+        )
     add_runtime_event(f"{label} — {phase} 시작 (cli_mode={cli_mode}, 입력 {len(prompt)}자)")
     render_html_snapshot()
     print(f"\U0001f914 {label} 생각 중... (입력 약 {len(prompt)}자, cli_mode={cli_mode})")
@@ -1533,9 +2150,22 @@ def run_step(
     before_snapshot, before_truncated = (
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
+    before_texts = capture_project_texts(project_path) if cli_mode == "coding" else {}
     t0 = time.time()
     try:
-        raw_text = ASK_FUNCS[agent](prompt, cli_mode)
+        ask_func = ASK_FUNCS[agent]
+        parameters = list(inspect.signature(ask_func).parameters.values())
+        supports_callback = len(parameters) >= 3 or any(
+            parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters
+        )
+        if supports_callback:
+            raw_text = ask_func(
+                prompt,
+                cli_mode,
+                lambda event: add_active_work_event(agent, event),
+            )
+        else:
+            raw_text = ask_func(prompt, cli_mode)
     except Exception as exc:
         raw_text = f"({label} 응답 없음 — 실행 중 예외: {exc})"
     elapsed = time.time() - t0
@@ -1543,7 +2173,31 @@ def run_step(
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
     changed_paths = compare_project_snapshots(before_snapshot, after_snapshot) if cli_mode == "coding" else []
-    visible_text, approval_requested = extract_approval_token(raw_text)
+    turn_diff = build_turn_diff(project_path, before_texts, changed_paths) if cli_mode == "coding" else ""
+    checkpoint_path = save_turn_checkpoint(
+        session_id,
+        int(state_snapshot.get("step_index", 0)),
+        agent,
+        turn_diff,
+    ) if cli_mode == "coding" else ""
+    if changed_paths:
+        add_active_work_event(
+            agent,
+            {
+                "kind": "file",
+                "text": f"작업 폴더 변경 {len(changed_paths)}개 감지",
+                "paths": [item["path"] for item in changed_paths[:20]],
+            },
+        )
+    with STATE_LOCK:
+        work_log = list(STATE.get("active_work_log", []))
+        actual_usage = dict(STATE.get("active_usage", {}))
+    actual_cost_usd = next(
+        (event.get("cost_usd") for event in reversed(work_log) if event.get("cost_usd") is not None),
+        0.0,
+    )
+    call_clean_text, agent_calls = extract_agent_calls(raw_text, agent, cli_mode)
+    visible_text, approval_requested = extract_approval_token(call_clean_text)
     text, output_truncated = clip_agent_output(visible_text)
     if approval_requested and not text:
         text = "사용자 승인을 요청했습니다."
@@ -1564,6 +2218,21 @@ def run_step(
         "approval_requested": approval_requested,
         "ok": not failed,
         "changed_paths": changed_paths[:100],
+        "turn_diff": turn_diff,
+        "checkpoint_path": checkpoint_path,
+        "work_log": work_log,
+        "actual_usage": actual_usage,
+        "actual_cost_usd": actual_cost_usd,
+        "agent_calls": agent_calls,
+        "delegation_depth": delegation_depth,
+        "shared_context": [
+            {
+                "agent": message.get("agent", ""),
+                "label": AGENTS.get(message.get("agent"), {}).get("label", "사용자"),
+                "phase": message.get("phase", ""),
+            }
+            for message in shared_messages
+        ],
         "snapshot_truncated": before_truncated or after_truncated or len(changed_paths) > 100,
     }
     with STATE_LOCK:
@@ -1574,6 +2243,8 @@ def run_step(
             STATE["active_started_at"] = None
             STATE["active_cli_mode"] = None
             STATE["active_prompt_chars"] = 0
+            STATE["active_work_log"] = []
+            STATE["active_usage"] = {}
             save_state(STATE)
     if not same_session:
         print(f"  \u26a0\ufe0f {label} 응답은 새 세션이 시작되어 폐기했습니다.")
@@ -1592,9 +2263,13 @@ def run_step(
             preview = ", ".join(f"{item['change']} {item['path']}" for item in changed_paths[:6])
             suffix = " ..." if len(changed_paths) > 6 else ""
             add_runtime_event(f"파일 변경 감지 {len(changed_paths)}개: {preview}{suffix}")
+            if checkpoint_path:
+                add_runtime_event(f"턴 체크포인트 저장: {checkpoint_path}")
         else:
             add_runtime_event("파일 변경 감지: 없음")
     added = add_message(agent, phase, text, meta, expected_session_id=session_id)
+    if added and not failed and agent_calls:
+        queue_agent_calls(agent, agent_calls, delegation_depth)
     return added and not failed
 
 
@@ -1646,7 +2321,27 @@ def worker_loop(session_id: str) -> None:
                 if STATE.get("id") != session_id:
                     break
                 STATE["step_index"] += 1
+                next_index = STATE["step_index"]
                 save_state(STATE)
+
+            if cli_mode == "coding" and (
+                next_index >= len(steps) or steps[next_index][1] == "최종 보고"
+            ):
+                add_runtime_event("자동 검증 시작")
+                validation_results = run_project_validation(load_project_path())
+                with STATE_LOCK:
+                    if STATE.get("id") == session_id:
+                        STATE["validation_results"] = validation_results
+                        save_state(STATE)
+                if not validation_results:
+                    add_runtime_event("자동 검증 명령을 찾지 못했습니다.")
+                for result in validation_results:
+                    level = "info" if result["ok"] else "error"
+                    add_runtime_event(
+                        f'{result["label"]}: {"통과" if result["ok"] else "실패"} '
+                        f'({result["elapsed"]}초)',
+                        level=level,
+                    )
 
             if phase == CONFIRM_PHASE and not CONTROL["approval_requested"]:
                 mark_approval_requested(agent, phase)
@@ -1851,11 +2546,15 @@ def state_json_payload() -> dict:
         messages = list(STATE["messages"])
         finished = STATE.get("finished", False)
         topic = STATE.get("topic", "").strip()
+        session_name = STATE.get("name") or topic or "새 세션"
         mode = STATE.get("mode", "discussion")
         active_id = STATE.get("id", "")
         enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
         agent_settings = normalize_agent_settings(STATE.get("agent_settings"))
         total_est_tokens = STATE.get("total_est_tokens", 0)
+        total_actual_tokens = STATE.get("total_actual_tokens", 0)
+        total_actual_cost_usd = STATE.get("total_actual_cost_usd", 0.0)
+        budget = dict(STATE.get("budget") or {})
         total_elapsed_time = STATE.get("total_elapsed_time", 0.0)
         active_agent = STATE.get("active_agent")
         active_phase = STATE.get("active_phase")
@@ -1863,10 +2562,18 @@ def state_json_payload() -> dict:
         active_cli_mode = STATE.get("active_cli_mode")
         active_prompt_chars = STATE.get("active_prompt_chars", 0)
         runtime_events = list(STATE.get("runtime_events", []))[-20:]
+        active_work_log = list(STATE.get("active_work_log", []))[-40:]
+        active_usage = dict(STATE.get("active_usage", {}))
+        validation_results = list(STATE.get("validation_results", []))
+        delegation_history = list(STATE.get("delegation_history", []))[-20:]
     active_elapsed = max(0.0, round(time.time() - active_started_at, 1)) if active_started_at else 0.0
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<div class="empty-state">아직 대화가 없습니다.</div>'
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
+    last_model_message = next((message for message in reversed(messages) if message.get("agent") in AGENT_ORDER), None)
+    can_retry = bool(
+        CONTROL["paused"] and last_model_message and not (last_model_message.get("meta") or {}).get("ok", True)
+    )
     return {
         "feed_html": bubbles,
         "topic_section_html": topic_section_html(topic, mode, enabled_agents, active_id, agent_settings),
@@ -1882,6 +2589,10 @@ def state_json_payload() -> dict:
         "intervention_pending": CONTROL["intervention_pending"],
         "intervention_intent": CONTROL["intervention_intent"],
         "topic": html.escape(topic) if topic else "",
+        "session_name": html.escape(session_name),
+        "tags": list(STATE.get("tags", [])),
+        "favorite": bool(STATE.get("favorite", False)),
+        "archived": bool(STATE.get("archived", False)),
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
         "enabled_agents": enabled_agents,
@@ -1896,6 +2607,14 @@ def state_json_payload() -> dict:
         "memory_dir": html.escape(str(session_memory_dir(active_id))) if active_id else "",
         "profile_path": html.escape(str(session_profile_path(active_id))) if active_id else "",
         "total_est_tokens": total_est_tokens,
+        "total_actual_tokens": total_actual_tokens,
+        "total_actual_cost_usd": total_actual_cost_usd,
+        "budget": budget,
+        "budget_exceeded": budget_exceeded_reason({
+            "budget": budget,
+            "total_actual_tokens": total_actual_tokens,
+            "total_actual_cost_usd": total_actual_cost_usd,
+        }),
         "total_elapsed_time": round(total_elapsed_time, 1),
         "message_count": len(messages),
         "active_agent": active_agent,
@@ -1904,6 +2623,13 @@ def state_json_payload() -> dict:
         "active_cli_mode": active_cli_mode,
         "active_prompt_chars": active_prompt_chars,
         "runtime_events": runtime_events,
+        "can_retry": can_retry,
+        "active_work_log": active_work_log,
+        "active_usage": active_usage,
+        "validation_results": validation_results,
+        "delegation_history": delegation_history,
+        "delegation_count": STATE.get("delegation_count", 0),
+        "agent_usage": agent_usage_summary(messages),
     }
 
 
@@ -1915,10 +2641,47 @@ def sessions_list_payload() -> dict:
         items.append({
             **s,
             "topic": s["topic"] or "(주제 없음)",
+            "name": s["name"],
             "mode_label": MODE_LABELS.get(s["mode"], s["mode"]),
             "is_active": s["id"] == active_id,
         })
     return {"sessions": items, "active_id": active_id}
+
+
+def agent_usage_summary(messages: list[dict]) -> dict:
+    summary = {
+        agent: {
+            "turns": 0,
+            "estimated_tokens": 0,
+            "prompt_chars": 0,
+            "output_chars": 0,
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+        }
+        for agent in AGENT_ORDER
+    }
+    for message in messages:
+        agent = message.get("agent")
+        if agent not in summary:
+            continue
+        meta = message.get("meta") or {}
+        row = summary[agent]
+        row["turns"] += 1
+        row["estimated_tokens"] += int(meta.get("est_tokens", 0) or 0)
+        row["prompt_chars"] += int(meta.get("prompt_chars", 0) or 0)
+        row["output_chars"] += int(meta.get("output_chars", 0) or 0)
+        usage = meta.get("actual_usage") or {}
+        for key in (
+            "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+            "cached_input_tokens", "output_tokens",
+        ):
+            row[key] += int(usage.get(key, 0) or 0)
+        row["cost_usd"] += float(meta.get("actual_cost_usd", 0.0) or 0.0)
+    return summary
 
 
 def session_detail_payload(session_id: str) -> dict | None:
@@ -1941,6 +2704,10 @@ def session_detail_payload(session_id: str) -> dict | None:
             data.get("topic", ""), mode, enabled_agents, session_id, agent_settings
         ),
         "topic": html.escape(data.get("topic", "")),
+        "session_name": html.escape(data.get("name") or data.get("topic") or "새 세션"),
+        "tags": data.get("tags", []),
+        "favorite": bool(data.get("favorite", False)),
+        "archived": bool(data.get("archived", False)),
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
         "enabled_agents": enabled_agents,
@@ -1957,7 +2724,16 @@ def session_detail_payload(session_id: str) -> dict | None:
         "status": "완료" if data.get("finished", False) else "저장됨",
         "message_count": len(messages),
         "total_est_tokens": data.get("total_est_tokens", 0),
+        "total_actual_tokens": data.get("total_actual_tokens", 0),
+        "total_actual_cost_usd": data.get("total_actual_cost_usd", 0.0),
+        "budget": data.get("budget", {"token_limit": 0, "cost_limit_usd": 0.0}),
         "total_elapsed_time": round(data.get("total_elapsed_time", 0.0), 1),
+        "agent_usage": agent_usage_summary(messages),
+        "active_work_log": [],
+        "active_usage": {},
+        "validation_results": data.get("validation_results", []),
+        "delegation_history": data.get("delegation_history", []),
+        "delegation_count": data.get("delegation_count", 0),
     }
 
 
@@ -1983,6 +2759,142 @@ def profile_payload(session_id: str | None = None) -> dict | None:
         "content": content,
         "is_active": target_id == active_id,
     }
+
+
+def rename_session(session_id: str, name: str) -> dict:
+    clean_name = re.sub(r"\s+", " ", name).strip()[:80]
+    if not clean_name:
+        return {"error": "세션 이름을 입력해주세요."}
+    with STATE_LOCK:
+        if STATE.get("id") == session_id:
+            STATE["name"] = clean_name
+            save_state(STATE)
+            return {"success": True, "id": session_id, "name": clean_name, "is_active": True}
+    data = load_session(session_id)
+    if data is None:
+        return {"error": "세션을 찾을 수 없습니다."}
+    data["name"] = clean_name
+    path = SESSIONS_DIR / f"{session_id}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"success": True, "id": session_id, "name": clean_name, "is_active": False}
+
+
+def update_session_metadata(session_id: str, tags: str, favorite: bool, archived: bool) -> dict:
+    clean_tags = [item.strip()[:24] for item in tags.split(",") if item.strip()][:8]
+    with STATE_LOCK:
+        if STATE.get("id") == session_id:
+            STATE.update(tags=clean_tags, favorite=favorite, archived=archived)
+            save_state(STATE)
+            return {"success": True, "id": session_id, "tags": clean_tags, "favorite": favorite, "archived": archived}
+    data = load_session(session_id)
+    if data is None:
+        return {"error": "세션을 찾을 수 없습니다."}
+    data.update(tags=clean_tags, favorite=favorite, archived=archived)
+    (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"success": True, "id": session_id, "tags": clean_tags, "favorite": favorite, "archived": archived}
+
+
+def delete_session(session_id: str) -> dict:
+    with STATE_LOCK:
+        if STATE.get("id") == session_id:
+            return {"error": "현재 세션은 삭제할 수 없습니다. 새 세션을 만든 뒤 삭제해주세요."}
+    removed = False
+    for path in (SESSIONS_DIR / f"{session_id}.json", SESSIONS_DIR / f"{session_id}.md"):
+        if path.exists():
+            path.unlink()
+            removed = True
+    memory_path = session_memory_dir(session_id)
+    if memory_path.exists():
+        shutil.rmtree(memory_path)
+        removed = True
+    return {"success": removed, "id": session_id} if removed else {"error": "세션을 찾을 수 없습니다."}
+
+
+def clone_session(session_id: str) -> dict:
+    source = load_session(session_id)
+    if source is None:
+        return {"error": "세션을 찾을 수 없습니다."}
+    cancel_active_cli_processes()
+    clone = normalize_state(json.loads(json.dumps(source, ensure_ascii=False)))
+    old_id = clone.get("id", session_id)
+    clone["id"] = new_session_id()
+    clone["created_at"] = datetime.now().isoformat(timespec="seconds")
+    clone["name"] = f'{clone.get("name") or clone.get("topic") or "세션"} · 분기'[:80]
+    clone["favorite"] = False
+    clone["archived"] = False
+    clone["active_agent"] = None
+    clone["active_phase"] = None
+    clone["active_started_at"] = None
+    clone["active_cli_mode"] = None
+    clone["active_prompt_chars"] = 0
+    clone["active_work_log"] = []
+    clone["active_usage"] = {}
+    with STATE_LOCK:
+        STATE.clear()
+        STATE.update(clone)
+        save_state(STATE)
+    source_memory = session_memory_dir(old_id)
+    target_memory = session_memory_dir(clone["id"])
+    if source_memory.exists():
+        shutil.copytree(source_memory, target_memory, dirs_exist_ok=True)
+    CONTROL["paused"] = True
+    CONTROL["stopped"] = False
+    CONTROL["awaiting_approval"] = False
+    CONTROL["approval_requested"] = False
+    CONTROL["approval_requested_by"] = []
+    return {"success": True, "id": clone["id"], "name": clone["name"]}
+
+
+def prompt_preview_payload(agent: str) -> dict:
+    if agent not in AGENT_ORDER:
+        return {"error": "모델을 선택해주세요."}
+    with STATE_LOCK:
+        state = dict(STATE)
+        messages = list(STATE.get("messages", []))
+        enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+        steps = steps_for_mode(STATE.get("mode", "discussion"), enabled)
+        step_index = int(STATE.get("step_index", 0))
+    instruction = "현재 주제와 공유된 최신 발언을 검토하고, 자신의 역할에 맞는 다음 의견을 간결하게 정리해라."
+    phase = "사용자 미리보기"
+    if step_index < len(steps) and steps[step_index][0] == agent:
+        _agent, phase, instruction, _cli_mode = steps[step_index]
+    transcript, shared = build_shared_transcript(messages, enabled)
+    prompt = compose_agent_prompt(
+        load_team_prompt(), state.get("topic", ""), build_memory_context(state), transcript, instruction
+    )
+    return {
+        "agent": agent,
+        "label": AGENTS[agent]["label"],
+        "phase": phase,
+        "prompt": prompt,
+        "characters": len(prompt),
+        "estimated_tokens": estimate_tokens(prompt),
+        "shared_context": [AGENTS.get(message.get("agent"), {}).get("label", "사용자") for message in shared],
+    }
+
+
+def rollback_checkpoint_files(checkpoint: str, paths: list[str]) -> dict:
+    try:
+        checkpoint_path = Path(checkpoint).resolve()
+        memory_root = MEMORY_DIR.resolve()
+        if not checkpoint_path.is_relative_to(memory_root) or not checkpoint_path.is_file():
+            return {"error": "유효한 체크포인트가 아닙니다."}
+    except (OSError, ValueError):
+        return {"error": "체크포인트 경로를 확인할 수 없습니다."}
+    clean_paths = [path for path in paths if path and ".." not in Path(path).parts][:50]
+    if not clean_paths:
+        return {"error": "되돌릴 파일을 선택해주세요."}
+    git = shutil.which("git") or "git"
+    command = [git, "apply", "--reverse", "--whitespace=nowarn"]
+    for path in clean_paths:
+        command.append(f"--include={path}")
+    command.append(str(checkpoint_path))
+    result = subprocess.run(command, cwd=load_project_path(), capture_output=True)
+    if result.returncode != 0:
+        detail = decode_cli_output(result.stderr or result.stdout).strip()
+        return {"error": f"변경을 되돌리지 못했습니다: {detail[:500]}"}
+    add_runtime_event(f"체크포인트에서 {len(clean_paths)}개 파일 되돌림: {', '.join(clean_paths[:6])}")
+    return {"success": True, "paths": clean_paths}
 
 
 def save_profile_content(content: str, session_id: str | None = None) -> dict:
@@ -2084,6 +2996,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 active_phase = STATE.get("active_phase")
                 active_started_at = STATE.get("active_started_at")
                 topic = STATE.get("topic", "")
+                session_name = STATE.get("name", "")
                 mode = STATE.get("mode", "")
             status = status_text()
             paused = CONTROL["paused"]
@@ -2098,7 +3011,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             active_tick = int(time.time()) if active_agent else 0
             version_str = (
                 f"{messages_count}_{finished}_{total_est_tokens}_{total_elapsed_time}_"
-                f"{active_agent}_{active_phase}_{active_started_at}_{topic}_{mode}_{status}_{paused}_{stopped}_"
+                f"{active_agent}_{active_phase}_{active_started_at}_{topic}_{session_name}_{mode}_{status}_{paused}_{stopped}_"
                 f"{awaiting_approval}_{approval_deferred}_{approval_requested}_{approval_requested_by}_"
                 f"{approval_rejected}_{intervention_pending}_{intervention_intent}_"
                 f"{len(CONNECTION_STATUS)}_{active_tick}"
@@ -2166,6 +3079,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(payload)
             return
+        if parsed.path == "/prompt-preview.json":
+            agent = parse_qs(parsed.query).get("agent", ["codex"])[0]
+            self._send_json(prompt_preview_payload(agent))
+            return
         maybe_autostart_worker()
         self._send_html(render_dashboard())
 
@@ -2187,6 +3104,8 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             if topic:
                 with STATE_LOCK:
                     STATE["topic"] = topic
+                    if not STATE.get("name") or STATE.get("name") == "새 세션":
+                        STATE["name"] = topic[:80]
                     STATE["mode"] = mode
                     STATE["enabled_agents"] = enabled_agents
                     STATE["agent_settings"] = agent_settings
@@ -2222,7 +3141,42 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             self._send_json(save_profile_content(content, session_id))
             return
 
+        if self.path == "/session/name":
+            form = self._read_form()
+            session_id = form.get("id", [""])[0].strip()
+            name = form.get("name", [""])[0]
+            self._send_json(rename_session(session_id, name))
+            return
+
+        if self.path == "/session/meta":
+            form = self._read_form()
+            self._send_json(update_session_metadata(
+                form.get("id", [""])[0].strip(),
+                form.get("tags", [""])[0],
+                form.get("favorite", ["false"])[0].lower() == "true",
+                form.get("archived", ["false"])[0].lower() == "true",
+            ))
+            return
+
+        if self.path == "/session/delete":
+            form = self._read_form()
+            self._send_json(delete_session(form.get("id", [""])[0].strip()))
+            return
+
+        if self.path == "/session/clone":
+            form = self._read_form()
+            self._send_json(clone_session(form.get("id", [""])[0].strip()))
+            return
+
+        if self.path == "/checkpoint/rollback":
+            form = self._read_form()
+            checkpoint = form.get("checkpoint", [""])[0]
+            paths = form.get("path", [])
+            self._send_json(rollback_checkpoint_files(checkpoint, paths))
+            return
+
         if self.path == "/restart":
+            cancel_active_cli_processes()
             with STATE_LOCK:
                 STATE.clear()
                 STATE.update(new_state())
@@ -2247,18 +3201,30 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             form = self._read_form()
             text = form.get("text", [""])[0].strip()
             intent = form.get("intent", ["question"])[0].strip()
+            source = form.get("source", ["composer"])[0].strip()
+            with STATE_LOCK:
+                current_mode = STATE.get("mode", "discussion")
+            effective_intent = intent
+            if intent == "redirect" and source == "composer" and current_mode == "coding":
+                effective_intent = "execute"
             requested_targets = form.get("target")
             targets = normalize_target_agents(requested_targets)
-            spec = INTERVENTION_INTENTS.get(intent, INTERVENTION_INTENTS["question"])
+            spec = INTERVENTION_INTENTS.get(effective_intent, INTERVENTION_INTENTS["question"])
             if not text:
                 self._send_json({"error": "메시지 내용이 비어 있습니다."})
                 return
-            if intent != "note" and not targets:
+            if effective_intent != "note" and not targets:
                 self._send_json({"error": "활성 상태인 대상 모델을 하나 이상 선택해주세요."})
                 return
 
+            with STATE_LOCK:
+                budget_reason = budget_exceeded_reason(STATE)
+            if effective_intent != "note" and budget_reason:
+                self._send_json({"error": budget_block_message(budget_reason)})
+                return
+
             try:
-                target_suffix = f" → {agent_names(targets)}" if intent != "note" else ""
+                target_suffix = f" → {agent_names(targets)}" if effective_intent != "note" else ""
                 with STATE_LOCK:
                     initial_msg_count = len(STATE["messages"])
 
@@ -2271,8 +3237,9 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 if current_msg_count <= initial_msg_count:
                     raise RuntimeError("대화 이력(STATE)에 메시지가 기록되지 않았습니다.")
 
-                mark_intervention(intent, targets)
-                if intent != "note" and has_topic:
+                cli_mode = "coding" if effective_intent == "execute" else "discussion"
+                mark_intervention(effective_intent, targets, cli_mode)
+                if effective_intent != "note" and has_topic:
                     start_worker_if_needed(force=True)
 
                 payload = state_json_payload()
@@ -2294,6 +3261,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/stop":
+            cancelled = cancel_active_cli_processes()
             CONTROL["stopped"] = True
             CONTROL["paused"] = False
             CONTROL["awaiting_approval"] = False
@@ -2303,6 +3271,46 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
+            if cancelled:
+                add_runtime_event(f"실행 중 CLI 강제 종료: {', '.join(cancelled)}")
+            self._send_json(state_json_payload())
+            return
+
+        if self.path == "/retry":
+            if budget_exceeded_reason(STATE):
+                self._send_json({"error": "예산을 먼저 늘린 뒤 재시도해주세요."})
+                return
+            CONTROL["paused"] = False
+            CONTROL["stopped"] = False
+            add_runtime_event("실패한 턴을 다시 실행합니다.")
+            start_worker_if_needed(force=True)
+            self._send_json(state_json_payload())
+            return
+
+        if self.path == "/budget":
+            form = self._read_form()
+            try:
+                token_limit = max(0, int(form.get("token_limit", ["0"])[0] or 0))
+                cost_limit = max(0.0, float(form.get("cost_limit_usd", ["0"])[0] or 0))
+            except ValueError:
+                self._send_json({"error": "예산 값을 숫자로 입력해주세요."})
+                return
+            with STATE_LOCK:
+                was_exceeded = bool(budget_exceeded_reason(STATE))
+                STATE["budget"] = {"token_limit": token_limit, "cost_limit_usd": cost_limit}
+                should_resume = bool(
+                    was_exceeded
+                    and not budget_exceeded_reason(STATE)
+                    and CONTROL["intervention_queue"]
+                )
+                if should_resume:
+                    CONTROL["paused"] = False
+                    CONTROL["stopped"] = False
+                save_state(STATE)
+            add_runtime_event(f"세션 예산 변경: 토큰 {token_limit:,}, 비용 ${cost_limit:.2f}")
+            if should_resume:
+                add_runtime_event("예산 차단이 해제되어 보류된 요청을 자동 재개합니다.")
+                start_worker_if_needed(force=True)
             self._send_json(state_json_payload())
             return
 

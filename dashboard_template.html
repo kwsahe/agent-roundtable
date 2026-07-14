@@ -17,6 +17,11 @@
       </div>
     </div>
     <button class="new-session" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>새 세션</button>
+    <div class="session-tools">
+      <input id="sessionSearch" type="search" placeholder="세션 검색" oninput="applySessionFilters()">
+      <label><input id="favoriteOnly" type="checkbox" onchange="applySessionFilters()"> 즐겨찾기</label>
+      <label><input id="showArchived" type="checkbox" onchange="applySessionFilters()"> 보관함</label>
+    </div>
     <div class="sidebar-section-title">Sessions</div>
     <div class="session-list" id="sessionList"></div>
   </aside>
@@ -31,10 +36,16 @@
         </div>
         <div>
           <div class="eyebrow">Roundtable</div>
-          <h2>Codex · Antigravity · Claude Code</h2>
+          <div class="session-heading">
+            <h2 id="sessionTitle">새 세션</h2>
+            <button class="icon-button" onclick="renameCurrentSession()" title="세션 이름 수정" aria-label="세션 이름 수정">
+              <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm17.71-10.04a1 1 0 000-1.42l-2.5-2.5a1 1 0 00-1.42 0l-1.96 1.96 3.75 3.75 2.13-1.79z"/></svg>
+            </button>
+          </div>
         </div>
       </div>
       <div class="status-pill" id="status">__STATUS__</div>
+      <button class="icon-button" onclick="enableNotifications()" title="알림 설정" aria-label="알림 설정"><svg viewBox="0 0 24 24"><path d="M12 22a2 2 0 002-2h-4a2 2 0 002 2zm6-6v-5a6 6 0 00-5-5.91V4a1 1 0 10-2 0v1.09A6 6 0 006 11v5l-2 2v1h16v-1l-2-2z"/></svg></button>
     </header>
 
     <section class="connection-bar" id="conn">
@@ -54,6 +65,7 @@
       <section id="thinkingIndicator" class="thinking-card" style="display:none">
         <div class="spinner"></div>
         <div class="thinking-text">생각 중...</div>
+        <ol class="active-work-log" id="activeWorkLog"></ol>
       </section>
 
       <section class="approve-banner" id="approveBanner" style="display:none">
@@ -85,7 +97,9 @@
         <button id="pauseBtn" class="ghost" onclick="ctrl('pause')" __PAUSE_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>일시정지</button>
         <button id="resumeBtn" class="ghost" onclick="ctrl('resume')" __RESUME_DISABLED__><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>재개</button>
         <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>중단</button>
+        <button id="retryBtn" class="ghost" onclick="retryFailedTurn()" style="display:none"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>실패 턴 재시도</button>
         <button class="ghost" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>새 세션</button>
+        <button class="ghost" onclick="openPromptPreview()">프롬프트 미리보기</button>
         <select id="composerModeSelect" aria-label="채팅 모드">
           <option value="discussion">토론 모드</option>
           <option value="coding">코딩 모드</option>
@@ -96,6 +110,7 @@
         <select id="interventionIntent" aria-label="개입 유형" __NO_TOPIC__>
           <option value="question">질문</option>
           <option value="redirect" selected>방향 수정</option>
+          <option value="execute">코딩 실행</option>
           <option value="hold">멈추고 답변</option>
           <option value="note">참고만</option>
         </select>
@@ -156,6 +171,13 @@
           <strong id="statCost">$0.0000</strong>
         </div>
       </div>
+      <p class="usage-share-note">세션 전체 토큰 점유율 · 합계 100%</p>
+      <div class="agent-usage" id="agentUsage"></div>
+      <button class="usage-detail-button" onclick="openTokenDetails()">
+        <span>모델별 토큰 추정량</span>
+        <strong>카드로 보기 ›</strong>
+      </button>
+      <p class="budget-warning" id="budgetWarning" style="display:none"></p>
     </div>
 
     <div class="inspector-card">
@@ -181,8 +203,36 @@
       <div class="card-title">Runtime</div>
       <div class="runtime-log" id="runtimeLog"></div>
     </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Agent Calls</div>
+      <div class="runtime-log" id="agentCallLog"><div class="runtime-empty">아직 에이전트 호출이 없습니다.</div></div>
+    </div>
+
+    <div class="inspector-card">
+      <div class="card-title">Validation</div>
+      <div class="runtime-log" id="validationLog"><div class="runtime-empty">아직 검증 결과가 없습니다.</div></div>
+    </div>
   </aside>
 </div>
+
+<dialog id="promptPreviewDialog" class="prompt-dialog">
+  <div class="dialog-header"><strong>최종 프롬프트 미리보기</strong><button class="icon-button" onclick="closePromptPreview()" aria-label="닫기">×</button></div>
+  <div class="preview-controls"><select id="previewAgent" onchange="loadPromptPreview()"><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="claude">Claude Code</option></select><span id="previewStats"></span></div>
+  <pre id="promptPreviewText"></pre>
+</dialog>
+<dialog id="tokenDetailsDialog" class="token-details-dialog">
+  <div class="dialog-header"><strong>모델별 토큰 상세</strong><button class="icon-button" onclick="closeTokenDetails()" aria-label="닫기">×</button></div>
+  <p class="token-details-summary" id="tokenDetailsSummary"></p>
+  <div class="token-details-grid" id="tokenDetailsGrid"></div>
+</dialog>
+<dialog id="sessionActionsDialog" class="session-dialog">
+  <div class="dialog-header"><strong id="sessionActionTitle">세션 관리</strong><button class="icon-button" onclick="closeSessionActions()" aria-label="닫기">×</button></div>
+  <input id="sessionActionId" type="hidden">
+  <label class="dialog-field"><span>태그</span><input id="sessionTagsInput" placeholder="쉼표로 구분"></label>
+  <div class="dialog-checks"><label><input id="sessionFavoriteInput" type="checkbox"> 즐겨찾기</label><label><input id="sessionArchivedInput" type="checkbox"> 보관</label></div>
+  <div class="dialog-actions"><button onclick="saveSessionMeta()">저장</button><button class="ghost" onclick="renameManagedSession()">이름 수정</button><button class="ghost" onclick="cloneManagedSession()">분기</button><button class="danger" onclick="deleteManagedSession()">삭제</button></div>
+</dialog>
 
 <script src="/static/dashboard.js"></script>
 </body>

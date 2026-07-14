@@ -1,5 +1,8 @@
 let viewingId = null;
 let lastVersion = null;
+let sessionsById = {};
+let allSessions = [];
+let sessionsActiveId = null;
 
 const AGENTS = {
   codex: { label: "Codex", color: "#4f8cff", avatar: "/static/agents/codex.png" },
@@ -41,18 +44,37 @@ function renderTopic(data) {
 }
 
 function renderSessionList(sessions, activeId) {
+  allSessions = sessions;
+  sessionsActiveId = activeId;
+  sessionsById = Object.fromEntries(sessions.map((session) => [session.id, session]));
+  applySessionFilters();
+}
+
+function applySessionFilters() {
   const list = $("sessionList");
+  const query = ($("sessionSearch")?.value || "").trim().toLowerCase();
+  const favoriteOnly = $("favoriteOnly")?.checked || false;
+  const showArchived = $("showArchived")?.checked || false;
+  const sessions = allSessions.filter((session) => {
+    const haystack = `${session.name || ""} ${session.topic || ""} ${(session.tags || []).join(" ")}`.toLowerCase();
+    return (!query || haystack.includes(query)) && (!favoriteOnly || session.favorite) && (showArchived ? session.archived : !session.archived);
+  });
   if (!sessions.length) {
     list.innerHTML = '<div class="empty-state">아직 세션이 없습니다.</div>';
     return;
   }
   list.innerHTML = sessions.map((s) => {
-    const cls = `session-item${s.id === (viewingId || activeId) ? " active" : ""}`;
-    const status = !s.topic ? "준비" : (s.finished ? "완료" : (s.id === activeId ? "진행 중" : "보류"));
-    return `<button class="${cls}" onclick="viewSession('${s.id}')">
-      <span class="s-topic">${escapeHtml(s.topic)}</span>
-      <span class="s-meta">${status} · ${escapeHtml(s.mode_label)} · ${s.message_count}개</span>
-    </button>`;
+    const cls = `session-item${s.id === (viewingId || sessionsActiveId) ? " active" : ""}`;
+    const status = !s.topic ? "준비" : (s.finished ? "완료" : (s.id === sessionsActiveId ? "진행 중" : "보류"));
+    const tags = (s.tags || []).map((tag) => `<span>#${escapeHtml(tag)}</span>`).join("");
+    return `<div class="session-row">
+      <button class="${cls}" onclick="viewSession('${s.id}')">
+        <span class="s-topic">${s.favorite ? "★ " : ""}${escapeHtml(s.name || s.topic)}</span>
+        <span class="s-meta">${status} · ${escapeHtml(s.mode_label)} · ${s.message_count}개</span>
+        <span class="s-tags">${tags}</span>
+      </button>
+      <button class="session-rename icon-button" onclick="openSessionActions('${s.id}')" title="세션 메뉴" aria-label="세션 메뉴">•••</button>
+    </div>`;
   }).join("");
 }
 
@@ -61,6 +83,68 @@ function updateStatsBoard(tokens, time) {
   $("statTime").textContent = formatTime(time);
   $("statCost").textContent = estimateCost(tokens);
 }
+
+function buildAgentUsageRows(data) {
+  const usage = data.agent_usage || {};
+  const rows = Object.entries(AGENTS).map(([key, info]) => {
+    const row = usage[key] || {};
+    const actualInput = Number(row.input_tokens || 0) + Number(row.cache_creation_input_tokens || 0) + Number(row.cache_read_input_tokens || 0);
+    const actual = actualInput + Number(row.output_tokens || 0);
+    const estimated = Number(row.estimated_tokens || 0);
+    return { key, info, row, actual, estimated, tokens: actual > 0 ? actual : estimated };
+  });
+  const total = rows.reduce((sum, item) => sum + item.tokens, 0);
+  rows.forEach((item) => {
+    item.percent = total > 0 ? (item.tokens / total) * 100 : 0;
+  });
+  return { rows, total };
+}
+
+function renderAgentUsage(data) {
+  const { rows } = buildAgentUsageRows(data);
+
+  $("agentUsage").innerHTML = rows.map(({ info, row, actual, tokens, percent }) => {
+    const percentText = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
+    const tokenText = actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`;
+    return `<div class="agent-usage-row" style="--agent-color:${info.color}">
+      <div class="agent-usage-head"><span>${info.label}<small>${row.turns || 0} turns</small></span><strong>${percentText} · ${tokenText}</strong></div>
+      <div class="agent-usage-track" role="progressbar" aria-label="${info.label} 토큰 점유율" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}">
+        <span style="width:${Math.min(100, percent).toFixed(2)}%"></span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderTokenDetails(data) {
+  const { rows, total } = buildAgentUsageRows(data);
+  $("tokenDetailsSummary").textContent = `세션 집계 ${formatTokens(total)} tokens · 세 모델 합계 100%`;
+  $("tokenDetailsGrid").innerHTML = rows.map(({ info, row, actual, estimated, tokens, percent }) => {
+    const cacheTokens = Number(row.cache_creation_input_tokens || 0)
+      + Number(row.cache_read_input_tokens || 0)
+      + Number(row.cached_input_tokens || 0);
+    const percentText = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
+    return `<article class="token-model-card" style="--agent-color:${info.color}">
+      <header><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><span>${actual > 0 ? "실제 사용량 기준" : "추정 사용량 기준"}</span></div></header>
+      <div class="token-model-total"><strong>${percentText}</strong><span>${actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`} tokens</span></div>
+      <div class="token-model-track"><span style="width:${Math.min(100, percent).toFixed(2)}%"></span></div>
+      <dl>
+        <div><dt>턴</dt><dd>${formatTokens(row.turns || 0)}</dd></div>
+        <div><dt>추정 토큰</dt><dd>~${formatTokens(estimated)}</dd></div>
+        <div><dt>입력</dt><dd>${actual > 0 ? formatTokens(row.input_tokens || 0) : "-"}</dd></div>
+        <div><dt>캐시</dt><dd>${cacheTokens > 0 ? formatTokens(cacheTokens) : "-"}</dd></div>
+        <div><dt>출력</dt><dd>${actual > 0 ? formatTokens(row.output_tokens || 0) : "-"}</dd></div>
+        <div><dt>비용</dt><dd>${Number(row.cost_usd || 0) > 0 ? `$${Number(row.cost_usd).toFixed(4)}` : "-"}</dd></div>
+      </dl>
+    </article>`;
+  }).join("");
+}
+
+function openTokenDetails() {
+  renderTokenDetails(lastState.latestPayload || {});
+  $("tokenDetailsDialog").showModal();
+}
+
+function closeTokenDetails() { $("tokenDetailsDialog").close(); }
 
 function renderAgentStack(data) {
   const enabled = (data.enabled_agents || []).length
@@ -116,6 +200,30 @@ function renderRuntimeLog(events) {
       <p>${escapeHtml(event.text)}</p>
     </div>
   `).join("");
+}
+
+function renderValidationLog(results) {
+  if (!results || !results.length) {
+    $("validationLog").innerHTML = '<div class="runtime-empty">아직 검증 결과가 없습니다.</div>';
+    return;
+  }
+  $("validationLog").innerHTML = results.map((result) => `
+    <details class="runtime-item ${result.ok ? "info" : "error"}">
+      <summary>${escapeHtml(result.label)} · ${result.ok ? "통과" : "실패"} · ${formatTime(result.elapsed)}</summary>
+      <p>${escapeHtml(result.output || "출력 없음")}</p>
+    </details>`).join("");
+}
+
+function renderAgentCalls(calls) {
+  if (!calls || !calls.length) {
+    $("agentCallLog").innerHTML = '<div class="runtime-empty">아직 에이전트 호출이 없습니다.</div>';
+    return;
+  }
+  $("agentCallLog").innerHTML = calls.slice(-10).reverse().map((call) => `
+    <div class="runtime-item">
+      <span>${escapeHtml(call.time || "")} · ${escapeHtml(call.mode || "discussion")}</span>
+      <p><strong>${escapeHtml(AGENTS[call.source]?.label || call.source)}</strong> → <strong>${escapeHtml(AGENTS[call.target]?.label || call.target)}</strong><br>${escapeHtml(call.task || "")}</p>
+    </div>`).join("");
 }
 
 let lastState = {};
@@ -191,6 +299,12 @@ function updateLiveCard(data) {
 }
 
 function updateInspector(data) {
+  lastState.latestPayload = data;
+  lastState.active_id = data.active_id || data.id || lastState.active_id;
+  if (lastState.sessionName !== data.session_name) {
+    $("sessionTitle").textContent = data.session_name || "새 세션";
+    lastState.sessionName = data.session_name;
+  }
   if (lastState.sideStatus !== data.status) {
     $("sideStatus").textContent = data.status || "-";
     lastState.sideStatus = data.status;
@@ -224,6 +338,19 @@ function updateInspector(data) {
     lastState.total_est_tokens = data.total_est_tokens;
     lastState.total_elapsed_time = data.total_elapsed_time;
   }
+  if (Number(data.total_actual_tokens || 0) > 0) {
+    $("statTokens").textContent = `${formatTokens(data.total_actual_tokens)} actual`;
+    $("statCost").textContent = `$${Number(data.total_actual_cost_usd || 0).toFixed(4)}`;
+  }
+  $("budgetWarning").textContent = data.budget_exceeded || "";
+  $("budgetWarning").style.display = data.budget_exceeded ? "block" : "none";
+  $("retryBtn").style.display = data.can_retry ? "inline-flex" : "none";
+  const usageKey = JSON.stringify(data.agent_usage || {});
+  if (lastState.agentUsageKey !== usageKey) {
+    renderAgentUsage(data);
+    if ($("tokenDetailsDialog")?.open) renderTokenDetails(data);
+    lastState.agentUsageKey = usageKey;
+  }
 
   // renderAgentStack 캐싱
   const enabled = (data.enabled_agents || []).length
@@ -246,10 +373,22 @@ function updateInspector(data) {
     renderRuntimeLog(data.runtime_events);
     lastState.runtimeLogKey = runtimeLogKey;
   }
+  const validationKey = JSON.stringify(data.validation_results || []);
+  if (lastState.validationKey !== validationKey) {
+    renderValidationLog(data.validation_results || []);
+    lastState.validationKey = validationKey;
+  }
+  const delegationKey = JSON.stringify(data.delegation_history || []);
+  if (lastState.delegationKey !== delegationKey) {
+    renderAgentCalls(data.delegation_history || []);
+    lastState.delegationKey = delegationKey;
+  }
 }
 
 function updateThinking(data) {
-  const thinkingKey = `${data.active_agent}_${data.active_phase}_${data.active_elapsed}_${data.active_cli_mode}_${data.active_prompt_chars}`;
+  const workLog = data.active_work_log || [];
+  const lastWork = workLog.length ? `${workLog[workLog.length - 1].time}_${workLog[workLog.length - 1].text}` : "";
+  const thinkingKey = `${data.active_agent}_${data.active_phase}_${data.active_elapsed}_${data.active_cli_mode}_${data.active_prompt_chars}_${workLog.length}_${lastWork}`;
   if (lastState.thinkingKey === thinkingKey) return;
   lastState.thinkingKey = thinkingKey;
 
@@ -265,7 +404,11 @@ function updateThinking(data) {
     <div class="thinking-text">
       <strong>${agent.label} · ${escapeHtml(data.active_phase || "생각 중")}</strong>
       <span>${formatTime(data.active_elapsed)} · ${escapeHtml(data.active_cli_mode || "-")} · 입력 ${formatTokens(data.active_prompt_chars)}자</span>
-    </div>`;
+    </div>
+    <ol class="active-work-log">${workLog.map((event) => {
+      const paths = (event.paths || []).map((path) => `<code>${escapeHtml(path)}</code>`).join("");
+      return `<li class="work-${escapeHtml(event.kind || "log")}"><span>${escapeHtml(event.time || "")}</span><p>${escapeHtml(event.text || "")}</p>${paths}</li>`;
+    }).join("")}</ol>`;
   box.style.display = "flex";
 }
 
@@ -348,6 +491,21 @@ function applyState(data) {
   updateInspector(data);
   updateThinking(data);
   syncTargetControls(data);
+  const notice = lastState.notificationSnapshot;
+  if (notice) {
+    if (!notice.awaiting && data.awaiting_approval) notifyTransition("승인 대기", `${data.approval_requested_by?.join(", ") || "에이전트"}의 승인이 필요합니다.`);
+    if (!notice.finished && data.finished) notifyTransition("세션 완료", data.session_name || "작업이 완료되었습니다.");
+    if (!notice.budget && data.budget_exceeded) notifyTransition("예산 한도 도달", data.budget_exceeded);
+    const latestEvent = (data.runtime_events || []).at(-1);
+    if (latestEvent?.level === "error" && latestEvent.text !== notice.errorText) notifyTransition("작업 실패", latestEvent.text);
+  }
+  const latestError = [...(data.runtime_events || [])].reverse().find((event) => event.level === "error");
+  lastState.notificationSnapshot = {
+    awaiting: !!data.awaiting_approval,
+    finished: !!data.finished,
+    budget: !!data.budget_exceeded,
+    errorText: latestError?.text || "",
+  };
 }
 
 async function loadSessions() {
@@ -356,6 +514,104 @@ async function loadSessions() {
     const data = await r.json();
     renderSessionList(data.sessions, data.active_id);
   } catch (_e) {}
+}
+
+async function renameSession(id) {
+  const session = sessionsById[id] || {};
+  const currentName = session.name || session.topic || "새 세션";
+  const name = prompt("세션 이름", currentName);
+  if (name === null || !name.trim()) return;
+  const response = await fetch("/session/name", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ id, name: name.trim() }).toString(),
+  });
+  const data = await response.json();
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  lastVersion = null;
+  await loadSessions();
+  if (id === (viewingId || (lastState.active_id || ""))) await poll(true);
+}
+
+async function renameCurrentSession() {
+  const id = viewingId || lastState.active_id;
+  if (!id) return;
+  await renameSession(id);
+}
+
+function openSessionActions(id) {
+  const session = sessionsById[id];
+  if (!session) return;
+  $("sessionActionId").value = id;
+  $("sessionActionTitle").textContent = session.name || session.topic || "세션 관리";
+  $("sessionTagsInput").value = (session.tags || []).join(", ");
+  $("sessionFavoriteInput").checked = !!session.favorite;
+  $("sessionArchivedInput").checked = !!session.archived;
+  $("sessionActionsDialog").showModal();
+}
+
+function closeSessionActions() { $("sessionActionsDialog").close(); }
+
+async function saveSessionMeta() {
+  const params = new URLSearchParams({
+    id: $("sessionActionId").value,
+    tags: $("sessionTagsInput").value,
+    favorite: String($("sessionFavoriteInput").checked),
+    archived: String($("sessionArchivedInput").checked),
+  });
+  const response = await fetch("/session/meta", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: params.toString() });
+  const data = await response.json();
+  if (data.error) alert(data.error); else { closeSessionActions(); await loadSessions(); }
+}
+
+async function renameManagedSession() {
+  const id = $("sessionActionId").value;
+  closeSessionActions();
+  await renameSession(id);
+}
+
+async function cloneManagedSession() {
+  const id = $("sessionActionId").value;
+  if (!confirm("이 세션의 대화와 설정을 새 분기로 복제할까요?")) return;
+  const response = await fetch("/session/clone", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ id }).toString() });
+  const data = await response.json();
+  if (data.error) alert(data.error); else location.reload();
+}
+
+async function deleteManagedSession() {
+  const id = $("sessionActionId").value;
+  if (!confirm("이 세션과 저장된 메모리를 삭제할까요?")) return;
+  const response = await fetch("/session/delete", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ id }).toString() });
+  const data = await response.json();
+  if (data.error) alert(data.error); else { closeSessionActions(); viewingId = null; await loadSessions(); await poll(true); }
+}
+
+async function openPromptPreview() {
+  $("promptPreviewDialog").showModal();
+  await loadPromptPreview();
+}
+
+function closePromptPreview() { $("promptPreviewDialog").close(); }
+
+async function loadPromptPreview() {
+  const response = await fetch(`/prompt-preview.json?agent=${encodeURIComponent($("previewAgent").value)}`);
+  const data = await response.json();
+  if (data.error) { $("promptPreviewText").textContent = data.error; return; }
+  $("previewStats").textContent = `${data.phase} · ${formatTokens(data.characters)}자 · 추정 ${formatTokens(data.estimated_tokens)} tokens · 공유 ${data.shared_context.join(", ") || "없음"}`;
+  $("promptPreviewText").textContent = data.prompt;
+}
+
+async function enableNotifications() {
+  if (!("Notification" in window)) { alert("이 브라우저는 알림을 지원하지 않습니다."); return; }
+  const permission = await Notification.requestPermission();
+  if (permission === "granted") new Notification("Agent Roundtable", { body: "알림을 활성화했습니다." });
+}
+
+function notifyTransition(title, body) {
+  if ("Notification" in window && Notification.permission === "granted") new Notification(title, { body });
 }
 
 async function viewSession(id) {
@@ -537,9 +793,54 @@ async function saveProfileEditor() {
 }
 
 async function stopSession() {
-  if (!confirm("중단할까요? 현재 진행 중인 턴이 끝나면 멈춥니다.")) return;
+  if (!confirm("중단할까요? 현재 실행 중인 CLI도 즉시 종료됩니다.")) return;
   await fetch("/stop", { method: "POST" });
   await poll(true);
+}
+
+async function retryFailedTurn() {
+  const response = await fetch("/retry", { method: "POST" });
+  const data = await response.json();
+  if (data.error) alert(data.error);
+  else applyState(data);
+}
+
+async function saveBudget() {
+  const params = new URLSearchParams({
+    token_limit: $("budgetTokenLimit").value || "0",
+    cost_limit_usd: $("budgetCostLimit").value || "0",
+  });
+  const response = await fetch("/budget", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  const data = await response.json();
+  if (data.error) alert(data.error);
+  else applyState(data);
+}
+
+async function rollbackSelectedFiles(button) {
+  const review = button.closest("[data-checkpoint]");
+  const paths = Array.from(review.querySelectorAll('input[type="checkbox"]:checked')).map((input) => input.value);
+  if (!paths.length) {
+    alert("되돌릴 파일을 선택해주세요.");
+    return;
+  }
+  if (!confirm(`${paths.length}개 파일에서 이 턴의 변경을 되돌릴까요?`)) return;
+  const params = new URLSearchParams({ checkpoint: review.dataset.checkpoint });
+  paths.forEach((path) => params.append("path", path));
+  const response = await fetch("/checkpoint/rollback", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  const data = await response.json();
+  if (data.error) alert(data.error);
+  else {
+    alert(`${data.paths.length}개 파일의 변경을 되돌렸습니다.`);
+    await poll(true);
+  }
 }
 
 async function restartSession() {
@@ -565,7 +866,7 @@ async function sendMessage() {
     const response = await fetch("/message", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `text=${encodeURIComponent(text)}&intent=${encodeURIComponent(intent)}${targetBody}`,
+      body: `text=${encodeURIComponent(text)}&intent=${encodeURIComponent(intent)}&source=composer${targetBody}`,
     });
     if (!response.ok) throw new Error("서버 연결 실패");
     const resData = await response.json();
@@ -599,7 +900,7 @@ async function sendApprovalMessage() {
     const response = await fetch("/message", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `text=${encodeURIComponent(text)}&intent=${encodeURIComponent(intent)}${targetBody}`,
+      body: `text=${encodeURIComponent(text)}&intent=${encodeURIComponent(intent)}&source=approval${targetBody}`,
     });
     if (!response.ok) throw new Error("서버 연결 실패");
     const resData = await response.json();
