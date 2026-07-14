@@ -363,6 +363,40 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(visible, "답변")
         self.assertEqual(calls, [])
 
+    def test_model_prefix_is_extracted_case_insensitively(self):
+        text, target = roundtable.extract_target_prefix("[Antigravity] 진행 시작")
+        self.assertEqual(text, "진행 시작")
+        self.assertEqual(target, "antigravity")
+
+        text, target = roundtable.extract_target_prefix("[Claude Code] 검증해줘")
+        self.assertEqual(text, "검증해줘")
+        self.assertEqual(target, "claude")
+
+    def test_agent_call_without_turn_diff_renders_safely(self):
+        message = {
+            "agent": "claude",
+            "phase": "호출 답변 · Antigravity",
+            "time": "17:10:36",
+            "text": "검토했습니다.",
+            "meta": {
+                "elapsed": 1.0,
+                "est_tokens": 10,
+                "prompt_chars": 20,
+                "output_chars": 10,
+                "cli_mode": "coding",
+                "agent_calls": [{
+                    "target": "antigravity",
+                    "mode": "coding",
+                    "task": "재검증",
+                }],
+            },
+        }
+
+        rendered = roundtable.bubble_html(message)
+
+        self.assertIn("후속 에이전트 호출", rendered)
+        self.assertNotIn("코드 변경 Diff", rendered)
+
     def test_unresolved_approval_is_restored_from_saved_messages(self):
         messages = [
             {
@@ -426,7 +460,32 @@ class RoundtableTests(unittest.TestCase):
         )
         self.assertEqual(roundtable.normalize_target_agents(["antigravity"]), [])
 
-    def test_execute_intervention_is_queued_in_coding_mode(self):
+    def test_read_only_workspace_downgrades_coding_execution(self):
+        roundtable.STATE["workspace_access"] = "read"
+        self.assertEqual(roundtable.effective_cli_mode("coding"), "discussion")
+        self.assertEqual(roundtable.effective_cli_mode("discussion"), "discussion")
+        roundtable.STATE["workspace_access"] = "write"
+        self.assertEqual(roundtable.effective_cli_mode("coding"), "coding")
+
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_workspace_selection_saves_path_and_access(
+        self, save_state, _event, _payload
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path_file = Path(temp_dir) / "PROJECT_PATH.txt"
+            with patch.object(roundtable, "PROJECT_PATH_FILE", path_file):
+                result = roundtable.update_workspace_selection(temp_dir, "read")
+
+            self.assertTrue(result["success"])
+            self.assertEqual(roundtable.STATE["workspace_access"], "read")
+            self.assertEqual(roundtable.STATE["workspace_path"], str(Path(temp_dir).resolve()))
+            self.assertIn(str(Path(temp_dir).resolve()), path_file.read_text(encoding="utf-8"))
+            save_state.assert_called_once()
+
+    @patch.object(roundtable, "save_state")
+    def test_execute_intervention_is_queued_in_coding_mode(self, _save_state):
         roundtable.STATE["enabled_agents"] = ["claude"]
         roundtable.CONTROL["intervention_queue"] = []
         roundtable.mark_intervention("execute", ["claude"], "coding")
@@ -436,7 +495,8 @@ class RoundtableTests(unittest.TestCase):
 
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "run_step", return_value=True)
-    def test_execute_intervention_calls_agent_with_coding_permissions(self, run_step, _event):
+    @patch.object(roundtable, "save_state")
+    def test_execute_intervention_calls_agent_with_coding_permissions(self, _save_state, run_step, _event):
         roundtable.STATE["enabled_agents"] = ["claude"]
         roundtable.CONTROL["intervention_queue"] = [{"intent": "execute", "targets": ["claude"], "cli_mode": "coding"}]
         roundtable.CONTROL["intervention_pending"] = True
@@ -446,7 +506,8 @@ class RoundtableTests(unittest.TestCase):
 
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "run_step", return_value=False)
-    def test_failed_intervention_is_requeued_for_retry(self, _run_step, _event):
+    @patch.object(roundtable, "save_state")
+    def test_failed_intervention_is_requeued_for_retry(self, _save_state, _run_step, _event):
         roundtable.STATE["enabled_agents"] = ["antigravity"]
         item = {"intent": "execute", "targets": ["antigravity"], "cli_mode": "coding"}
         roundtable.CONTROL["intervention_queue"] = [item]
@@ -458,6 +519,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertTrue(roundtable.CONTROL["paused"])
         self.assertTrue(roundtable.CONTROL["intervention_pending"])
         self.assertEqual(roundtable.CONTROL["intervention_queue"], [item])
+        self.assertEqual(roundtable.STATE["pending_interventions"], [item])
 
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "save_state")

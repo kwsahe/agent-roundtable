@@ -339,6 +339,14 @@ function updateInspector(data) {
     $("memoryPath").textContent = data.memory_dir || "세션 시작 후 표시됩니다.";
     lastState.memory_dir = data.memory_dir;
   }
+  if (lastState.workspacePath !== data.workspace_path) {
+    $("workspacePath").textContent = data.workspace_path || "작업 폴더가 선택되지 않았습니다.";
+    $("workspacePath").title = data.workspace_path || "";
+    lastState.workspacePath = data.workspace_path;
+  }
+  if (document.activeElement !== $("workspaceAccess") && data.workspace_access) {
+    $("workspaceAccess").value = data.workspace_access;
+  }
   const currentProfilePath = data.profile_path ? `Profile: ${data.profile_path}` : "Profile.md도 여기에 표시됩니다.";
   if (lastState.profilePath !== currentProfilePath) {
     $("profilePath").textContent = currentProfilePath;
@@ -815,6 +823,39 @@ async function retryFailedTurn() {
   const data = await response.json();
   if (data.error) alert(data.error);
   else applyState(data);
+}
+
+async function updateWorkspace(endpoint) {
+  const button = endpoint === "/workspace/select" ? $("workspacePickerButton") : $("workspaceAccessButton");
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.textContent = endpoint === "/workspace/select" ? "폴더 선택 창 대기 중..." : "권한 적용 중...";
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ access: $("workspaceAccess").value }).toString(),
+    });
+    const data = await response.json();
+    if (data.error) {
+      alert(data.error);
+      return;
+    }
+    applyState(data);
+  } catch (err) {
+    alert(`작업 폴더 설정 실패: ${err.message}`);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = original;
+  }
+}
+
+async function selectWorkspaceFolder() {
+  await updateWorkspace("/workspace/select");
+}
+
+async function applyWorkspaceAccess() {
+  await updateWorkspace("/workspace/access");
 }
 
 async function saveBudget() {

@@ -231,6 +231,35 @@ def load_project_path() -> Path:
         return ROOT
     return ROOT
 
+
+def save_project_path(path: Path) -> None:
+    PROJECT_PATH_FILE.write_text(
+        "# TriAgent Control 작업 폴더입니다. 대시보드에서 다시 선택할 수 있습니다.\n\n"
+        f"{path}\n",
+        encoding="utf-8",
+    )
+
+
+def choose_workspace_folder(initial_dir: Path) -> str | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(
+            parent=root,
+            title="TriAgent Control 작업 폴더 선택",
+            initialdir=str(initial_dir),
+            mustexist=True,
+        )
+        root.destroy()
+        return selected or None
+    except Exception as exc:
+        print(f"  ⚠️  작업 폴더 선택 창을 열지 못했습니다: {exc}")
+        return None
+
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 CODEX_CMD = os.environ.get("CODEX_CMD", "codex")
 AGY_CMD = os.environ.get("AGY_CMD", "agy")
@@ -258,6 +287,10 @@ MAX_SESSION_DELEGATIONS = 12
 _AGENT_CALL_RE = re.compile(
     r"^\s*CALL_AGENT:\s*(codex|antigravity|claude)\s*\|\s*(discussion|coding)\s*\|\s*(.+?)\s*$",
     re.IGNORECASE,
+)
+_TARGET_PREFIX_RE = re.compile(
+    r"^\s*\[(codex|antigravity|claude(?:\s+code)?)\]\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 AGENTS = {
@@ -1061,6 +1094,8 @@ def new_state() -> dict:
         "mode": "discussion",
         "enabled_agents": list(AGENT_ORDER),
         "agent_settings": normalize_agent_settings(None),
+        "workspace_path": str(load_project_path()),
+        "workspace_access": "write",
         "total_est_tokens": 0,
         "total_actual_tokens": 0,
         "total_actual_cost_usd": 0.0,
@@ -1077,6 +1112,7 @@ def new_state() -> dict:
         "validation_results": [],
         "delegation_count": 0,
         "delegation_history": [],
+        "pending_interventions": [],
     }
 
 
@@ -1093,6 +1129,9 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("finished", False)
     state.setdefault("topic", "")
     state.setdefault("mode", "discussion")
+    state.setdefault("workspace_path", str(load_project_path()))
+    state.setdefault("workspace_access", "write")
+    state["workspace_access"] = "write" if state.get("workspace_access") == "write" else "read"
     state.setdefault("total_est_tokens", 0)
     state.setdefault("total_actual_tokens", 0)
     state.setdefault("total_actual_cost_usd", 0.0)
@@ -1114,6 +1153,7 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("validation_results", [])
     state.setdefault("delegation_count", 0)
     state.setdefault("delegation_history", [])
+    state.setdefault("pending_interventions", [])
     state["enabled_agents"] = normalize_enabled_agents(state.get("enabled_agents"))
     state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
     return state
@@ -1488,6 +1528,16 @@ def extract_agent_calls(text: str, source_agent: str, current_cli_mode: str) -> 
     return "\n".join(kept_lines).rstrip(), calls
 
 
+def extract_target_prefix(text: str) -> tuple[str, str | None]:
+    match = _TARGET_PREFIX_RE.match(text or "")
+    if not match:
+        return (text or "").strip(), None
+    target = match.group(1).lower().replace(" ", "")
+    if target == "claudecode":
+        target = "claude"
+    return match.group(2).strip(), target
+
+
 def compose_agent_prompt(
     team_prompt: str,
     topic: str,
@@ -1532,6 +1582,7 @@ def compose_agent_prompt(
 
 STATE_LOCK = threading.Lock()
 STATE: dict = load_state()
+_RESTORED_INTERVENTIONS = list(STATE.get("pending_interventions", []))
 CONTROL = {
     "paused": False,
     "stopped": False,
@@ -1544,11 +1595,50 @@ CONTROL = {
     "approval_requested_by": [],
     "approval_rejected": False,
     "approval_seen_messages": 0,
-    "intervention_pending": False,
+    "intervention_pending": bool(_RESTORED_INTERVENTIONS),
     "intervention_seen_messages": 0,
-    "intervention_intent": "",
-    "intervention_queue": [],
+    "intervention_intent": _RESTORED_INTERVENTIONS[0].get("intent", "") if _RESTORED_INTERVENTIONS else "",
+    "intervention_queue": _RESTORED_INTERVENTIONS,
 }
+
+
+def workspace_access_mode() -> str:
+    with STATE_LOCK:
+        return "write" if STATE.get("workspace_access") == "write" else "read"
+
+
+def effective_cli_mode(requested_mode: str) -> str:
+    if requested_mode == "coding" and workspace_access_mode() != "write":
+        return "discussion"
+    return "coding" if requested_mode == "coding" else "discussion"
+
+
+def update_workspace_selection(path_text: str, access: str) -> dict:
+    candidate = Path(path_text).expanduser()
+    try:
+        candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return {"error": "선택한 작업 폴더를 찾을 수 없습니다."}
+    if not candidate.is_dir():
+        return {"error": "작업영역은 폴더만 선택할 수 있습니다."}
+    if not os.access(candidate, os.R_OK):
+        return {"error": "선택한 폴더에 읽기 권한이 없습니다."}
+    access = "write" if access == "write" else "read"
+    if access == "write" and not os.access(candidate, os.W_OK):
+        return {"error": "선택한 폴더에 쓰기 권한이 없습니다."}
+    try:
+        save_project_path(candidate)
+    except OSError as exc:
+        return {"error": f"PROJECT_PATH.txt 저장 실패: {exc}"}
+    with STATE_LOCK:
+        STATE["workspace_path"] = str(candidate)
+        STATE["workspace_access"] = access
+        save_state(STATE)
+    access_label = "읽기·쓰기" if access == "write" else "읽기 전용"
+    add_runtime_event(f"작업 폴더 변경: {candidate} ({access_label})")
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
 
 
 def unresolved_approval_requesters(messages: list[dict]) -> list[str]:
@@ -1735,13 +1825,6 @@ def bubble_html(m: dict) -> str:
                 f'{html.escape(item["change"])} {html.escape(item["path"])}</label>'
                 for item in meta.get("changed_paths", []) if not item["path"].endswith("/")
             )
-        if meta.get("agent_calls"):
-            calls_html = "".join(
-                f'<li><strong>{html.escape(AGENTS.get(call["target"], {}).get("label", call["target"]))}</strong>'
-                f' · {html.escape(call["mode"])} · {html.escape(call["task"])}</li>'
-                for call in meta["agent_calls"]
-            )
-            work_html += f'<div class="agent-calls"><span>후속 에이전트 호출</span><ul>{calls_html}</ul></div>'
             work_html += (
                 f'<details class="turn-diff"><summary>코드 변경 Diff</summary>'
                 f'<p>{checkpoint}</p><pre>{html.escape(meta["turn_diff"])}</pre>'
@@ -1749,6 +1832,13 @@ def bubble_html(m: dict) -> str:
                 f'<button class="danger compact" onclick="rollbackSelectedFiles(this)">선택 변경 되돌리기</button>'
                 f'</div></details>'
             )
+        if meta.get("agent_calls"):
+            calls_html = "".join(
+                f'<li><strong>{html.escape(AGENTS.get(call["target"], {}).get("label", call["target"]))}</strong>'
+                f' · {html.escape(call["mode"])} · {html.escape(call["task"])}</li>'
+                for call in meta["agent_calls"]
+            )
+            work_html += f'<div class="agent-calls"><span>후속 에이전트 호출</span><ul>{calls_html}</ul></div>'
 
     return f"""
     <div class="row {side}{highlight_class}">
@@ -1928,6 +2018,13 @@ def normalize_target_agents(targets: list[str] | None) -> list[str]:
     return [agent for agent in targets if agent in enabled]
 
 
+def persist_intervention_queue_locked() -> None:
+    STATE["pending_interventions"] = json.loads(json.dumps(
+        CONTROL["intervention_queue"], ensure_ascii=False
+    ))
+    save_state(STATE)
+
+
 def mark_intervention(intent: str, targets: list[str] | None = None, cli_mode: str = "discussion") -> None:
     intent = intent if intent in INTERVENTION_INTENTS else "question"
     if intent == "note":
@@ -1942,6 +2039,7 @@ def mark_intervention(intent: str, targets: list[str] | None = None, cli_mode: s
             "targets": target_agents,
             "cli_mode": "coding" if cli_mode == "coding" else "discussion",
         })
+        persist_intervention_queue_locked()
 
 
 def queue_agent_calls(source_agent: str, calls: list[dict], depth: int) -> list[dict]:
@@ -1978,7 +2076,7 @@ def queue_agent_calls(source_agent: str, calls: list[dict], depth: int) -> list[
         STATE["delegation_count"] = count
         CONTROL["intervention_pending"] = bool(CONTROL["intervention_queue"])
         if queued:
-            save_state(STATE)
+            persist_intervention_queue_locked()
     for entry in queued:
         add_runtime_event(
             f'{AGENTS[source_agent]["label"]} → {AGENTS[entry["target"]]["label"]} 호출 '
@@ -1997,6 +2095,7 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
         item = CONTROL["intervention_queue"].pop(0) if CONTROL["intervention_queue"] else None
         CONTROL["intervention_pending"] = bool(CONTROL["intervention_queue"])
         CONTROL["intervention_intent"] = CONTROL["intervention_queue"][0]["intent"] if CONTROL["intervention_queue"] else ""
+        persist_intervention_queue_locked()
     if not item:
         return False
     intent = item["intent"] if item["intent"] in INTERVENTION_INTENTS else "question"
@@ -2029,6 +2128,7 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
                 CONTROL["intervention_pending"] = True
                 CONTROL["intervention_intent"] = item["intent"]
                 CONTROL["paused"] = True
+                persist_intervention_queue_locked()
             return True
     with STATE_LOCK:
         CONTROL["intervention_seen_messages"] = len(STATE["messages"])
@@ -2086,6 +2186,15 @@ def run_step(
     expected_session_id: str | None = None,
     delegation_depth: int = 0,
 ) -> bool:
+    requested_cli_mode = cli_mode
+    cli_mode = effective_cli_mode(cli_mode)
+    if requested_cli_mode == "coding" and cli_mode != "coding":
+        instruction = (
+            f"{instruction}\n\n"
+            "현재 작업영역 권한은 읽기 전용이다. 파일을 생성·수정·삭제하지 말고, "
+            "분석 결과와 변경 제안만 보고해라."
+        )
+        add_runtime_event(f"{AGENTS[agent]['label']} 코딩 요청을 읽기 전용 분석으로 전환")
     label = AGENTS[agent]["label"]
     separator(f"{label} — {phase}")
     with STATE_LOCK:
@@ -2471,10 +2580,11 @@ def topic_section_html(
     active_id: str,
     agent_settings: dict | None = None,
 ) -> str:
+    access_label = "읽기·쓰기" if workspace_access_mode() == "write" else "읽기 전용"
     project_path_line = (
         f'<p>코딩 모드 작업 경로: '
         f'{html.escape(str(load_project_path()))} '
-        f'(<code>{html.escape(PROJECT_PATH_FILE.name)}</code>에서 변경)</p>'
+        f'· 권한: {access_label}</p>'
     )
 
     if topic:
@@ -2569,6 +2679,7 @@ def state_json_payload() -> dict:
         active_usage = dict(STATE.get("active_usage", {}))
         validation_results = list(STATE.get("validation_results", []))
         delegation_history = list(STATE.get("delegation_history", []))[-20:]
+        workspace_access = STATE.get("workspace_access", "write")
     active_elapsed = max(0.0, round(time.time() - active_started_at, 1)) if active_started_at else 0.0
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<div class="empty-state">아직 대화가 없습니다.</div>'
@@ -2609,6 +2720,9 @@ def state_json_payload() -> dict:
         "active_id": active_id,
         "memory_dir": html.escape(str(session_memory_dir(active_id))) if active_id else "",
         "profile_path": html.escape(str(session_profile_path(active_id))) if active_id else "",
+        "workspace_path": str(load_project_path()),
+        "workspace_access": workspace_access,
+        "workspace_access_label": "읽기·쓰기" if workspace_access == "write" else "읽기 전용",
         "total_est_tokens": total_est_tokens,
         "total_actual_tokens": total_actual_tokens,
         "total_actual_cost_usd": total_actual_cost_usd,
@@ -2769,6 +2883,9 @@ def session_detail_payload(session_id: str) -> dict | None:
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "memory_dir": html.escape(str(session_memory_dir(session_id))),
         "profile_path": html.escape(str(session_profile_path(session_id))),
+        "workspace_path": data.get("workspace_path") or str(load_project_path()),
+        "workspace_access": data.get("workspace_access", "write"),
+        "workspace_access_label": "읽기·쓰기" if data.get("workspace_access", "write") == "write" else "읽기 전용",
         "finished": data.get("finished", False),
         "is_active": is_active,
         "status": "완료" if data.get("finished", False) else "저장됨",
@@ -3138,6 +3255,24 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         self._send_html(render_dashboard())
 
     def do_POST(self) -> None:
+        if self.path == "/workspace/select":
+            form = self._read_form()
+            access = form.get("access", ["read"])[0]
+            selected = choose_workspace_folder(load_project_path())
+            if not selected:
+                payload = state_json_payload()
+                payload["cancelled"] = True
+                self._send_json(payload)
+                return
+            self._send_json(update_workspace_selection(selected, access))
+            return
+
+        if self.path == "/workspace/access":
+            form = self._read_form()
+            access = form.get("access", ["read"])[0]
+            self._send_json(update_workspace_selection(str(load_project_path()), access))
+            return
+
         if self.path == "/topic":
             form = self._read_form()
             topic = form.get("topic", [""])[0].strip()
@@ -3260,6 +3395,14 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 effective_intent = "execute"
             requested_targets = form.get("target")
             targets = normalize_target_agents(requested_targets)
+            if effective_intent != "note":
+                text, preferred_target = extract_target_prefix(text)
+                if preferred_target:
+                    preferred = normalize_target_agents([preferred_target])
+                    if not preferred:
+                        self._send_json({"error": f"[{preferred_target}] 모델이 현재 비활성 상태입니다."})
+                        return
+                    targets = preferred + [target for target in targets if target != preferred_target]
             spec = INTERVENTION_INTENTS.get(effective_intent, INTERVENTION_INTENTS["question"])
             if not text:
                 self._send_json({"error": "메시지 내용이 비어 있습니다."})
@@ -3322,6 +3465,8 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
+            with STATE_LOCK:
+                persist_intervention_queue_locked()
             if cancelled:
                 add_runtime_event(f"실행 중 CLI 강제 종료: {', '.join(cancelled)}")
             self._send_json(state_json_payload())
@@ -3378,6 +3523,8 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
+            with STATE_LOCK:
+                persist_intervention_queue_locked()
             self._send_json(state_json_payload())
             return
 
@@ -3396,6 +3543,8 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_pending"] = False
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
+            with STATE_LOCK:
+                persist_intervention_queue_locked()
             self._send_json(state_json_payload())
             return
 

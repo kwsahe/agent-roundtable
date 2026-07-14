@@ -511,6 +511,34 @@ button.danger {
   overflow-wrap: anywhere;
 }
 
+.workspace-path {
+  min-height: 34px;
+  margin: 0;
+  color: var(--muted);
+  font: 10px/1.45 "SF Mono", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.workspace-permission {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.workspace-permission select {
+  width: 100%;
+  min-width: 0;
+}
+
+.workspace-picker-button {
+  width: 100%;
+  margin-top: 8px;
+  justify-content: center;
+  background: #151a23;
+  border-color: var(--line-strong);
+}
+
 .profile-editor {
   margin-top: 10px;
 }
