@@ -56,6 +56,175 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("--safe-mode", args)
         self.assertIn("--no-session-persistence", args)
 
+    def test_discussion_read_mode_enables_claude_read_tools(self):
+        roundtable.STATE["mode"] = "discussion"
+        roundtable.STATE["discussion_project_access"] = "read"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_claude("프로젝트 확인")
+        args = run_cli.call_args.args[2]
+        self.assertEqual(args[args.index("--tools") + 1], "Read,Glob,Grep")
+        self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.load_project_path())
+
+    def test_discussion_without_project_uses_no_tools_and_isolated_directory(self):
+        roundtable.STATE["mode"] = "discussion"
+        roundtable.STATE["discussion_project_access"] = "none"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_claude("대화만 진행")
+        args = run_cli.call_args.args[2]
+        self.assertEqual(args[args.index("--tools") + 1], "")
+        self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.NO_PROJECT_DIR)
+
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_codex("대화만 진행")
+        self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.NO_PROJECT_DIR)
+        self.assertEqual(
+            run_cli.call_args.args[2][run_cli.call_args.args[2].index("--sandbox") + 1],
+            "read-only",
+        )
+
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_antigravity("대화만 진행")
+        self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.NO_PROJECT_DIR)
+        self.assertNotIn("--add-dir", run_cli.call_args.args[2])
+
+    def test_all_agents_receive_write_access_for_coding_turns(self):
+        roundtable.STATE["mode"] = "coding"
+        roundtable.STATE["workspace_access"] = "write"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        for agent, ask_func in roundtable.ASK_FUNCS.items():
+            with self.subTest(agent=agent), patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+                ask_func("구현", "coding")
+                args = run_cli.call_args.args[2]
+                if agent == "codex":
+                    self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+                elif agent == "claude":
+                    self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
+                    self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
+                else:
+                    self.assertEqual(args[args.index("--mode") + 1], "accept-edits")
+
+    def test_all_agents_receive_write_access_in_writable_discussion(self):
+        roundtable.STATE["mode"] = "discussion"
+        roundtable.STATE["discussion_project_access"] = "write"
+        roundtable.STATE["workspace_access"] = "write"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        for agent, ask_func in roundtable.ASK_FUNCS.items():
+            with self.subTest(agent=agent), patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+                ask_func("쓰기 권한 확인", "discussion")
+                args = run_cli.call_args.args[2]
+                if agent == "codex":
+                    self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+                elif agent == "claude":
+                    self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
+                    self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
+                else:
+                    self.assertEqual(args[args.index("--mode") + 1], "accept-edits")
+
+    def test_coding_mode_grants_write_access_to_every_turn(self):
+        state = roundtable.new_state()
+        state["mode"] = "coding"
+        self.assertEqual(roundtable.turn_project_access("discussion", state), "write")
+        self.assertEqual(roundtable.turn_project_access("coding", state), "write")
+
+    def test_discussion_mode_can_grant_write_access(self):
+        state = roundtable.new_state()
+        state["mode"] = "discussion"
+        state["discussion_project_access"] = "write"
+        self.assertEqual(roundtable.turn_project_access("discussion", state), "write")
+        self.assertEqual(roundtable.discussion_project_access_label("write"), "프로젝트 읽기·쓰기")
+
+    def test_continuous_mode_cycle_contains_development_review_and_synthesis(self):
+        steps = roundtable.steps_for_mode("continuous", roundtable.AGENT_ORDER)
+        self.assertEqual([step[1] for step in steps[:3]], ["개발 진행"] * 3)
+        self.assertEqual([step[1] for step in steps[3:6]], ["교차 검토"] * 3)
+        self.assertEqual(steps[-1][1], "토론 결과 통합")
+        self.assertTrue(all(step[3] == "coding" for step in steps[:3]))
+        self.assertTrue(all(step[3] == "discussion" for step in steps[3:]))
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "run_project_validation", return_value=[])
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_continuous_worker_wraps_into_next_cycle(
+        self, _save_state, _event, validation, _render
+    ):
+        roundtable.STATE.update(
+            topic="반복 개발",
+            mode="continuous",
+            enabled_agents=list(roundtable.AGENT_ORDER),
+            step_index=0,
+            finished=False,
+        )
+        roundtable.CONTROL.update(
+            stopped=False,
+            paused=False,
+            approval_requested=False,
+            intervention_pending=False,
+            worker_session_id=roundtable.STATE["id"],
+        )
+        cycle = roundtable.steps_for_mode("continuous", roundtable.AGENT_ORDER)
+        phases = []
+
+        def fake_run_step(_agent, phase, _instruction, _cli_mode, **_kwargs):
+            phases.append(phase)
+            if len(phases) == len(cycle) + 1:
+                roundtable.CONTROL["stopped"] = True
+            return True
+
+        with patch.object(roundtable, "run_step", side_effect=fake_run_step):
+            roundtable.worker_loop(roundtable.STATE["id"])
+
+        self.assertIn("개발 진행 · 사이클 1", phases[0])
+        self.assertIn("토론 결과 통합 · 사이클 1", phases[len(cycle) - 1])
+        self.assertIn("개발 진행 · 사이클 2", phases[len(cycle)])
+        self.assertEqual(roundtable.STATE["step_index"], len(cycle) + 1)
+        self.assertFalse(roundtable.STATE["finished"])
+        validation.assert_called_once()
+
+    @patch.object(roundtable, "start_worker_if_needed")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_switching_to_continuous_mode_starts_fresh_writable_cycle(
+        self, _save_state, _event, start_worker
+    ):
+        roundtable.STATE.update(
+            topic="반복 개발",
+            mode="discussion",
+            step_index=5,
+            finished=True,
+            workspace_access="read",
+            continuous_stopped=True,
+        )
+        payload = roundtable.switch_mode("continuous")
+        self.assertTrue(payload["success"])
+        self.assertEqual(roundtable.STATE["mode"], "continuous")
+        self.assertEqual(roundtable.STATE["step_index"], 0)
+        self.assertEqual(roundtable.STATE["workspace_access"], "write")
+        self.assertFalse(roundtable.STATE["finished"])
+        self.assertFalse(roundtable.STATE["continuous_stopped"])
+        start_worker.assert_called_once_with(force=True)
+
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_discussion_project_access_can_be_changed(self, save_state, _event, _payload):
+        result = roundtable.update_discussion_project_access("none")
+        self.assertTrue(result["success"])
+        self.assertEqual(roundtable.STATE["discussion_project_access"], "none")
+        save_state.assert_called_once()
+
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_discussion_project_access_can_enable_write(self, save_state, _event, _payload):
+        result = roundtable.update_discussion_project_access("write")
+        self.assertTrue(result["success"])
+        self.assertEqual(roundtable.STATE["discussion_project_access"], "write")
+        self.assertEqual(roundtable.STATE["workspace_access"], "write")
+        save_state.assert_called_once()
+
     def test_selected_antigravity_preset_is_forwarded(self):
         preset = "Gemini 3.5 Flash (High)"
         roundtable.STATE["agent_settings"]["antigravity"] = {
@@ -73,6 +242,179 @@ class RoundtableTests(unittest.TestCase):
             "codex": {"model": "unknown", "effort": "extreme"},
         })
         self.assertEqual(settings["codex"], {"model": "", "effort": ""})
+
+    def test_unknown_roles_fall_back_to_unassigned(self):
+        roles = roundtable.normalize_agent_roles({
+            "codex": "backend",
+            "claude": "not-a-role",
+        })
+        self.assertEqual(roles["codex"], "backend")
+        self.assertEqual(roles["claude"], "")
+        self.assertEqual(roles["antigravity"], "")
+
+    def test_role_discussion_steps_require_structured_selection(self):
+        steps = roundtable.steps_for_mode("discussion", roundtable.AGENT_ORDER)
+        role_steps = [step for step in steps if step[1] in {"역할 선언", "역할 확정"}]
+        self.assertEqual(len(role_steps), 3)
+        self.assertTrue(all("ROLE_SELECT: 역할_ID" in step[2] for step in role_steps))
+        self.assertTrue(all("backend=백엔드 개발자" in step[2] for step in role_steps))
+
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "write_session_roles")
+    @patch.object(roundtable, "save_state")
+    def test_role_discussion_auto_selects_and_avoids_duplicates(
+        self, _save_state, _write_roles, _event
+    ):
+        codex_role = roundtable.choose_discussion_role("codex", "backend")
+        antigravity_role = roundtable.choose_discussion_role("antigravity", "backend")
+        claude_role = roundtable.choose_discussion_role("claude", "frontend")
+
+        self.assertEqual(codex_role, "backend")
+        self.assertEqual(antigravity_role, "qa")
+        self.assertEqual(claude_role, "frontend")
+        self.assertEqual(len(set(roundtable.STATE["agent_roles"].values())), 3)
+
+    def test_role_selection_marker_is_removed_from_visible_answer(self):
+        text = "백엔드를 맡겠습니다.\nROLE_SELECT: backend"
+        self.assertEqual(roundtable.extract_role_selection(text), "backend")
+        self.assertEqual(roundtable.strip_role_selection(text), "백엔드를 맡겠습니다.")
+
+    def test_mode_notice_is_rendered_as_system_chat(self):
+        notice = roundtable.mode_notice_html("coding", "read")
+        self.assertIn("현재 세션 모드", notice)
+        self.assertIn("코딩 모드", notice)
+        self.assertIn("프로젝트 읽기·쓰기", notice)
+        self.assertIn("row center system", notice)
+
+    @patch.object(roundtable, "add_message", return_value=True)
+    @patch.object(roundtable, "save_state")
+    def test_complete_roles_are_announced_in_chat(self, _save_state, add_message):
+        roundtable.STATE["agent_roles"] = {
+            "codex": "backend",
+            "antigravity": "qa",
+            "claude": "frontend",
+        }
+
+        self.assertTrue(roundtable.announce_roles_if_complete())
+
+        args = add_message.call_args.args
+        self.assertEqual(args[:2], ("system", "역할 배정 완료"))
+        self.assertIn("Codex**: 백엔드 개발자", args[2])
+        self.assertIn("Antigravity**: QA·테스트 담당", args[2])
+        self.assertIn("Claude Code**: 프론트엔드 개발자", args[2])
+        self.assertFalse(roundtable.announce_roles_if_complete())
+
+    def test_legacy_role_block_message_is_removed_on_load(self):
+        state = roundtable.new_state()
+        state["messages"] = [
+            {"agent": "codex", "text": "차단", "meta": {"failure_kind": "role_unassigned"}},
+            {"agent": "codex", "text": "정상", "meta": {"ok": True}},
+        ]
+        normalized = roundtable.normalize_state(state)
+        self.assertEqual([message["text"] for message in normalized["messages"]], ["정상"])
+
+    def test_duplicate_roles_are_rejected(self):
+        result = roundtable.update_agent_roles({
+            "codex": "backend",
+            "antigravity": "backend",
+            "claude": "frontend",
+        })
+        self.assertIn("error", result)
+
+    def test_orphaned_intervention_approval_finds_requesting_agent(self):
+        messages = [
+            {
+                "agent": "antigravity",
+                "phase": "개입 답변",
+                "text": "승인이 필요합니다.",
+                "meta": {"approval_requested": True},
+            },
+            {"agent": "user", "phase": "승인", "text": "승인"},
+        ]
+        self.assertEqual(roundtable.orphaned_approval_followup_agents(messages), ["antigravity"])
+
+    @patch.object(roundtable, "start_worker_if_needed")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "add_message", return_value=True)
+    @patch.object(roundtable, "save_state")
+    def test_approval_preserves_queue_and_adds_requester_followup(
+        self, _save_state, _add_message, _event, start_worker
+    ):
+        roundtable.STATE.update(
+            finished=True,
+            messages=[{
+                "agent": "antigravity",
+                "phase": "개입 답변",
+                "text": "승인이 필요합니다.",
+                "meta": {"approval_requested": True},
+            }],
+        )
+        existing = {
+            "intent": "delegation",
+            "targets": ["codex"],
+            "cli_mode": "discussion",
+            "custom_instruction": "검토",
+        }
+        roundtable.CONTROL.update(
+            awaiting_approval=True,
+            approval_requested=True,
+            intervention_queue=[existing],
+            intervention_pending=True,
+        )
+
+        self.assertTrue(roundtable.approve_pending_work())
+
+        self.assertEqual(roundtable.CONTROL["intervention_queue"][0], existing)
+        followup = roundtable.CONTROL["intervention_queue"][1]
+        self.assertEqual(followup["intent"], "execute")
+        self.assertEqual(followup["targets"], ["antigravity"])
+        self.assertTrue(followup["approved_followup"])
+        self.assertFalse(roundtable.STATE["finished"])
+        start_worker.assert_called_once_with(force=True)
+
+    def test_role_scope_detects_files_outside_assignment(self):
+        state = roundtable.new_state()
+        state["agent_roles"]["codex"] = "backend"
+        changed = [
+            {"path": "app.py", "change": "modified"},
+            {"path": "static/dashboard.js", "change": "modified"},
+        ]
+        self.assertEqual(
+            roundtable.role_scope_violations("codex", changed, state),
+            ["static/dashboard.js"],
+        )
+
+    def test_role_prompt_contains_user_assignment(self):
+        state = roundtable.new_state()
+        state["agent_roles"]["claude"] = "frontend"
+        prompt = roundtable.role_prompt("claude", state)
+        self.assertIn("프론트엔드 개발자", prompt)
+        self.assertIn("다른 역할의 작업을 대신 수행", prompt)
+
+    def test_unassigned_role_does_not_enforce_file_scope(self):
+        state = roundtable.new_state()
+        changed = [
+            {"path": "app.py", "change": "modified"},
+            {"path": "static/dashboard.js", "change": "modified"},
+        ]
+        self.assertEqual(roundtable.role_scope_violations("codex", changed, state), [])
+        self.assertIn("일반 작업자", roundtable.role_prompt("codex", state))
+
+    def test_session_roles_file_tracks_current_assignments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = roundtable.new_state()
+            state["name"] = "역할 테스트"
+            state["agent_roles"] = {
+                "codex": "backend",
+                "antigravity": "qa",
+                "claude": "frontend",
+            }
+            with patch.object(roundtable, "MEMORY_DIR", Path(temp_dir)):
+                roundtable.write_session_roles(state)
+                content = roundtable.session_roles_path(state["id"]).read_text(encoding="utf-8")
+        self.assertIn("Codex | 활성 | 백엔드 개발자", content)
+        self.assertIn("Antigravity | 활성 | QA·테스트 담당", content)
+        self.assertIn("Claude Code | 활성 | 프론트엔드 개발자", content)
 
     def test_cli_output_falls_back_to_windows_korean_encoding(self):
         message = "명령줄이 너무 깁니다."
@@ -320,6 +662,18 @@ class RoundtableTests(unittest.TestCase):
         self.assertLessEqual(len(transcript), 500)
         self.assertIn("일부 생략", transcript)
 
+    def test_validation_results_are_shared_with_review_turns(self):
+        state = roundtable.new_state()
+        state["validation_results"] = [{
+            "label": "Python unittest",
+            "ok": False,
+            "output": "FAILED test_checkout",
+        }]
+        context = roundtable.build_memory_context(state)
+        self.assertIn("최근 자동 검증", context)
+        self.assertIn("Python unittest: 실패", context)
+        self.assertIn("FAILED test_checkout", context)
+
     def test_each_agent_receives_the_other_agents_recent_messages(self):
         messages = [
             {"agent": "codex", "phase": "검토", "text": "Codex의 판단"},
@@ -563,6 +917,7 @@ class RoundtableTests(unittest.TestCase):
 
         self.assertTrue(payload["success"])
         self.assertEqual(roundtable.STATE["step_index"], 2)
+        self.assertEqual(roundtable.STATE["workspace_access"], "write")
         self.assertFalse(roundtable.STATE["finished"])
         start_worker.assert_called_once_with(force=True)
 
@@ -606,6 +961,12 @@ class RoundtableTests(unittest.TestCase):
             enabled_agents=["codex"],
             mode="discussion",
             step_index=0,
+        )
+        roundtable.CONTROL.update(
+            stopped=False,
+            paused=False,
+            approval_requested=False,
+            intervention_pending=False,
         )
         session_id = roundtable.STATE["id"]
 
@@ -683,6 +1044,30 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(roundtable.CONTROL["approval_requested_by"], ["Codex · 승인 테스트"])
         self.assertEqual(add_message.call_args.args[2], "파일 변경 전에 승인이 필요합니다.")
         self.assertTrue(add_message.call_args.args[3]["approval_requested"])
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "add_message", return_value=True)
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "build_memory_context", return_value="")
+    @patch.object(roundtable, "load_team_prompt", return_value="공통 지침")
+    @patch.object(roundtable, "save_state")
+    def test_continuous_mode_ignores_agent_approval_token(
+        self, _save_state, _team, _memory, _event, add_message, _render
+    ):
+        roundtable.STATE.update(topic="반복 개발", mode="continuous")
+        roundtable.CONTROL["approval_requested"] = False
+        roundtable.CONTROL["approval_requested_by"] = []
+        with patch.dict(
+            roundtable.ASK_FUNCS,
+            {"codex": lambda _prompt, _mode: "계속 진행합니다.\nAPPROVE"},
+        ):
+            succeeded = roundtable.run_step(
+                "codex", "교차 검토 · 사이클 1", "검토해라", "discussion",
+                expected_session_id=roundtable.STATE["id"],
+            )
+        self.assertTrue(succeeded)
+        self.assertFalse(roundtable.CONTROL["approval_requested"])
+        self.assertFalse(add_message.call_args.args[3]["approval_requested"])
 
 
 if __name__ == "__main__":

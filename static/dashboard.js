@@ -39,6 +39,8 @@ function renderTopic(data) {
     <div class="topic">
       <h3>${data.topic} <span style="color:var(--faint);font-weight:500">· ${data.mode_label || "-"}</span></h3>
       <p>활성: ${data.enabled_agents_label || "-"} · 비활성: ${data.disabled_agents_label || "없음"}</p>
+      <p>프로젝트 접근: ${["coding", "continuous"].includes(data.mode) ? "읽기·쓰기 (코딩 실행)" : (data.discussion_project_access_label || "프로젝트 읽기")}</p>
+      ${data.mode === "continuous" ? `<p>현재 반복: 사이클 ${data.continuous_cycle || 1}</p>` : ""}
       <p>저장 폴더: ${data.memory_dir || "-"}</p>
     </div>`;
 }
@@ -168,11 +170,34 @@ function renderAgentStack(data) {
     const cls = `agent-chip${isOn ? "" : " off"}${active === key ? " active" : ""}`;
     const state = active === key ? (data.active_phase || "작업 중") : (isOn ? "대기" : "꺼짐");
     const model = (data.agent_setting_labels || {})[key] || "CLI 기본값";
+    const role = (data.role_labels || {})[key] || "미지정";
     return `<div class="${cls}" style="--agent-color:${info.color}">
-      <div class="agent-chip-identity"><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><small>${escapeHtml(model)}</small></div></div>
+      <div class="agent-chip-identity"><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><small>${escapeHtml(model)} · ${escapeHtml(role)}</small></div></div>
       <span>${escapeHtml(state)}</span>
     </div>`;
   }).join("");
+}
+
+function renderRoleControls(data, containerId = "roleControls", prefix = "role_") {
+  const enabled = new Set(data.enabled_agents || []);
+  const roles = data.agent_roles || {};
+  const catalog = data.role_catalog || [];
+  const options = [
+    '<option value="">역할 미지정</option>',
+    ...catalog.map((role) => `<option value="${escapeHtml(role.id)}" title="${escapeHtml(role.summary)}">${escapeHtml(role.label)}</option>`),
+  ].join("");
+  $(containerId).innerHTML = Object.entries(AGENTS).map(([agent, info]) => `
+    <label class="role-row ${enabled.has(agent) ? "" : "off"}">
+      <span><img src="${info.avatar}" alt=""><strong>${info.label}</strong></span>
+      <select id="${prefix}${agent}" aria-label="${info.label} 역할" ${data.active_agent || viewingId ? "disabled" : ""}>
+        ${options}
+      </select>
+    </label>`).join("");
+  Object.keys(AGENTS).forEach((agent) => {
+    const select = $(`${prefix}${agent}`);
+    if (select) select.value = roles[agent] || "";
+  });
+  $("roleSaveButton").disabled = !!data.active_agent || !!viewingId;
 }
 
 function syncAgentModelCards() {
@@ -323,14 +348,29 @@ function updateInspector(data) {
   }
   if (lastState.sideMode !== data.mode_label) {
     $("sideMode").textContent = data.mode_label || "-";
+    $("headerMode").textContent = data.mode_label || "준비";
+    $("headerMode").dataset.mode = data.mode || "discussion";
     lastState.sideMode = data.mode_label;
   }
+  $("sideCycleRow").style.display = data.mode === "continuous" ? "flex" : "none";
+  $("sideCycle").textContent = `사이클 ${data.continuous_cycle || 1}`;
   if ($("sessionModeSelect") && data.mode && $("sessionModeSelect").value !== data.mode) {
     $("sessionModeSelect").value = data.mode;
   }
   if ($("composerModeSelect") && data.mode && $("composerModeSelect").value !== data.mode) {
     $("composerModeSelect").value = data.mode;
   }
+  ["discussionAccessSelect", "composerDiscussionAccess"].forEach((id) => {
+    const select = $(id);
+    if (select && document.activeElement !== select) {
+      select.value = data.discussion_project_access || "read";
+      select.disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
+    }
+  });
+  ["discussionAccessButton", "composerDiscussionAccessButton"].forEach((id) => {
+    const button = $(id);
+    if (button) button.disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
+  });
   if (lastState.sideMessages !== data.message_count) {
     $("sideMessages").textContent = data.message_count || 0;
     lastState.sideMessages = data.message_count;
@@ -347,10 +387,17 @@ function updateInspector(data) {
   if (document.activeElement !== $("workspaceAccess") && data.workspace_access) {
     $("workspaceAccess").value = data.workspace_access;
   }
+  $("workspaceAccess").disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
+  $("workspaceAccessButton").disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
   const currentProfilePath = data.profile_path ? `Profile: ${data.profile_path}` : "Profile.md도 여기에 표시됩니다.";
   if (lastState.profilePath !== currentProfilePath) {
     $("profilePath").textContent = currentProfilePath;
     lastState.profilePath = currentProfilePath;
+  }
+  const currentRolesPath = data.roles_path ? `Roles: ${data.roles_path}` : "Roles.md도 여기에 표시됩니다.";
+  if (lastState.rolesPath !== currentRolesPath) {
+    $("rolesPath").textContent = currentRolesPath;
+    lastState.rolesPath = currentRolesPath;
   }
 
   if (lastState.total_est_tokens !== data.total_est_tokens || lastState.total_elapsed_time !== data.total_elapsed_time) {
@@ -377,10 +424,15 @@ function updateInspector(data) {
     ? data.enabled_agents
     : Object.keys(AGENTS).filter((key) => (data.enabled_agents_label || "").includes(AGENTS[key].label));
   const active = data.active_agent;
-  const agentStackKey = `${enabled.join(",")}_${active}_${data.active_phase}_${JSON.stringify(data.agent_setting_labels || {})}`;
+  const agentStackKey = `${enabled.join(",")}_${active}_${data.active_phase}_${JSON.stringify(data.agent_setting_labels || {})}_${JSON.stringify(data.role_labels || {})}`;
   if (lastState.agentStackKey !== agentStackKey) {
     renderAgentStack(data);
     lastState.agentStackKey = agentStackKey;
+  }
+  const roleControlsKey = JSON.stringify([data.agent_roles || {}, data.role_catalog || [], enabled, active, viewingId]);
+  if (lastState.roleControlsKey !== roleControlsKey) {
+    renderRoleControls(data);
+    lastState.roleControlsKey = roleControlsKey;
   }
 
   updateLiveCard(data);
@@ -409,27 +461,45 @@ function updateThinking(data) {
   const workLog = data.active_work_log || [];
   const lastWork = workLog.length ? `${workLog[workLog.length - 1].time}_${workLog[workLog.length - 1].text}` : "";
   const thinkingKey = `${data.active_agent}_${data.active_phase}_${data.active_elapsed}_${data.active_cli_mode}_${data.active_prompt_chars}_${workLog.length}_${lastWork}`;
-  if (lastState.thinkingKey === thinkingKey) return;
+  if (lastState.thinkingKey === thinkingKey && $("thinkingIndicator")) return;
   lastState.thinkingKey = thinkingKey;
 
-  const box = $("thinkingIndicator");
   if (!data.active_agent) {
-    box.style.display = "none";
+    $("thinkingIndicator")?.remove();
     return;
   }
   const agent = AGENTS[data.active_agent] || { label: data.active_agent, color: "#4f8cff" };
-  box.style.setProperty("--spinner-color", agent.color);
+  const feed = $("feed");
+  const scroller = $("conversationScroll");
+  const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  let box = $("thinkingIndicator");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "thinkingIndicator";
+    box.className = "row live-thinking-row is-new";
+    feed.appendChild(box);
+  }
   box.innerHTML = `
-    <div class="spinner"></div>
-    <div class="thinking-text">
-      <strong>${agent.label} · ${escapeHtml(data.active_phase || "생각 중")}</strong>
-      <span>${formatTime(data.active_elapsed)} · ${escapeHtml(data.active_cli_mode || "-")} · 입력 ${formatTokens(data.active_prompt_chars)}자</span>
+    <div class="bubble" style="--accent:${agent.color}">
+      <div class="meta">
+        <img class="avatar" src="${agent.avatar || ""}" alt="">
+        <span class="name" style="color:${agent.color}">${escapeHtml(agent.label)}</span>
+        <span class="phase">${escapeHtml(data.active_phase || "실행 및 추론 중")}</span>
+        <span class="time">${formatTime(data.active_elapsed)}</span>
+      </div>
+      <div class="live-thinking-summary">
+        <span class="spinner" style="--spinner-color:${agent.color}"></span>
+        <div><strong>실행 및 추론 중</strong><span>${escapeHtml(data.active_cli_mode || "-")} · 입력 ${formatTokens(data.active_prompt_chars)}자</span></div>
+      </div>
+      <ol class="active-work-log">${workLog.map((event) => {
+        const paths = (event.paths || []).map((path) => `<code>${escapeHtml(path)}</code>`).join("");
+        return `<li class="work-${escapeHtml(event.kind || "log")}"><span>${escapeHtml(event.time || "")}</span><p>${escapeHtml(event.text || "")}</p>${paths}</li>`;
+      }).join("")}</ol>
     </div>
-    <ol class="active-work-log">${workLog.map((event) => {
-      const paths = (event.paths || []).map((path) => `<code>${escapeHtml(path)}</code>`).join("");
-      return `<li class="work-${escapeHtml(event.kind || "log")}"><span>${escapeHtml(event.time || "")}</span><p>${escapeHtml(event.text || "")}</p>${paths}</li>`;
-    }).join("")}</ol>`;
-  box.style.display = "flex";
+  `;
+  if (distanceFromBottom < 160) {
+    requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+  }
 }
 
 function updateFeedHtml(feedHtml) {
@@ -650,7 +720,7 @@ async function viewSession(id) {
     $("viewingBanner").style.display = "flex";
     $("controlPanel").style.display = "none";
     $("approveBanner").style.display = "none";
-    $("thinkingIndicator").style.display = "none";
+    $("thinkingIndicator")?.remove();
     $("conversationScroll").scrollTop = 0;
     lastState.feed_html = null;
     lastState.topic_html = null;
@@ -727,12 +797,14 @@ async function submitTopic() {
   if (!topic) return;
   const modeEl = document.querySelector('input[name="mode"]:checked');
   const mode = modeEl ? modeEl.value : "discussion";
+  const discussionAccessEl = document.querySelector('input[name="discussion_project_access"]:checked');
+  const discussionProjectAccess = discussionAccessEl ? discussionAccessEl.value : "read";
   const agents = Array.from(document.querySelectorAll('input[name="agent"]:checked')).map((el) => el.value);
   if (!agents.length) {
     alert("최소 한 명의 에이전트를 선택해주세요.");
     return;
   }
-  const params = new URLSearchParams({ topic, mode });
+  const params = new URLSearchParams({ topic, mode, discussion_project_access: discussionProjectAccess });
   agents.forEach((agent) => params.append("agent", agent));
   Object.keys(AGENTS).forEach((agent) => {
     const model = document.querySelector(`[name="model_${agent}"]`);
@@ -777,6 +849,25 @@ async function changeSessionMode(source = "side") {
   }
   applyState(data);
   await loadSessions();
+}
+
+async function changeDiscussionAccess(source = "side") {
+  if (viewingId) {
+    alert("지난 세션은 읽기 전용입니다. 현재 세션으로 돌아가 변경해주세요.");
+    return;
+  }
+  const select = source === "composer" ? $("composerDiscussionAccess") : $("discussionAccessSelect");
+  const response = await fetch("/discussion-access", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `access=${encodeURIComponent(select.value)}`,
+  });
+  const data = await response.json();
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  applyState(data);
 }
 
 async function openProfileEditor() {
@@ -856,6 +947,41 @@ async function selectWorkspaceFolder() {
 
 async function applyWorkspaceAccess() {
   await updateWorkspace("/workspace/access");
+}
+
+function openRoleDialog() {
+  const data = lastState.latestPayload || {};
+  renderRoleControls(data, "roleDialogControls", "dialog_role_");
+  $("roleDialogSaveButton").disabled = !!data.active_agent || !!viewingId;
+  $("roleDialog").showModal();
+}
+
+function closeRoleDialog() {
+  $("roleDialog").close();
+}
+
+async function saveAgentRoles(source = "card") {
+  const prefix = source === "dialog" ? "dialog_role_" : "role_";
+  const params = new URLSearchParams();
+  Object.keys(AGENTS).forEach((agent) => params.set(`role_${agent}`, $(`${prefix}${agent}`).value));
+  const button = source === "dialog" ? $("roleDialogSaveButton") : $("roleSaveButton");
+  button.disabled = true;
+  try {
+    const response = await fetch("/roles", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+    const data = await response.json();
+    if (data.error) {
+      alert(data.error);
+      return;
+    }
+    applyState(data);
+    if (source === "dialog") closeRoleDialog();
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function saveBudget() {

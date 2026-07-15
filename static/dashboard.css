@@ -29,6 +29,13 @@
   box-sizing: border-box;
 }
 
+input,
+select,
+textarea {
+  min-width: 0;
+  max-width: 100%;
+}
+
 html,
 body {
   margin: 0;
@@ -331,7 +338,6 @@ button.danger {
 .panel,
 .composer,
 .approve-banner,
-.thinking-card,
 .inspector-card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -349,7 +355,6 @@ button.danger {
 .panel:hover,
 .composer:hover,
 .approve-banner:hover,
-.thinking-card:hover,
 .inspector-card:hover {
   border-color: rgba(255, 255, 255, 0.08);
   box-shadow: 0 8px 30px -2px rgba(0, 0, 0, 0.35), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
@@ -443,6 +448,59 @@ button.danger {
   padding: 6px 10px;
   font-size: 12px;
   white-space: nowrap;
+}
+
+.header-state {
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mode-pill {
+  padding: 4px 8px;
+  border: 1px solid rgba(79, 140, 255, 0.35);
+  border-radius: 999px;
+  background: rgba(79, 140, 255, 0.1);
+  color: #9bbcff;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.mode-pill[data-mode="coding"] {
+  border-color: rgba(66, 201, 145, 0.35);
+  background: rgba(66, 201, 145, 0.1);
+  color: #76ddb2;
+}
+
+.mode-pill[data-mode="continuous"] {
+  border-color: rgba(255, 138, 61, 0.4);
+  background: rgba(255, 138, 61, 0.1);
+  color: #ffad76;
+}
+
+.row.system .bubble {
+  border-style: dashed;
+  border-color: rgba(139, 149, 167, 0.32);
+  background: rgba(139, 149, 167, 0.06);
+}
+
+.row.system .text {
+  color: var(--muted);
+}
+
+.system-avatar {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid rgba(139, 149, 167, 0.35);
+  border-radius: 7px;
+  color: #b7c0cf;
+  font-size: 9px;
+  font-weight: 800;
 }
 
 .connection-bar,
@@ -557,6 +615,7 @@ button.danger {
 }
 
 .mode-choice,
+.discussion-access-choice,
 .agent-choice,
 .composer-actions,
 .approve-actions {
@@ -567,6 +626,7 @@ button.danger {
 }
 
 .mode-choice,
+.discussion-access-choice,
 .agent-choice {
   margin-top: 10px;
   color: var(--muted);
@@ -574,11 +634,23 @@ button.danger {
 }
 
 .mode-choice label,
+.discussion-access-choice label,
 .agent-choice label {
   display: inline-flex;
   gap: 7px;
   align-items: center;
   cursor: pointer;
+}
+
+.discussion-access-choice {
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.discussion-access-choice strong {
+  width: 100%;
+  color: var(--text);
+  font-size: 12px;
 }
 
 input[type="radio"],
@@ -991,28 +1063,45 @@ dialog::backdrop {
   flex-wrap: wrap;
 }
 
-.thinking-card {
-  max-width: 880px;
-  margin: 12px auto;
-  padding: 12px 14px;
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
+.live-thinking-row .bubble {
   border-style: dashed;
-  color: var(--muted);
-  position: sticky;
-  bottom: 12px;
-  z-index: 8;
-  background: rgba(14, 18, 26, 0.96);
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.32);
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--line));
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
 }
 
-.active-work-log {
-  grid-column: 2;
+.live-thinking-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  color: var(--muted);
+}
+
+.live-thinking-summary > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 9px;
+}
+
+.live-thinking-summary strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.live-thinking-summary span {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.live-thinking-summary .spinner {
+  flex: 0 0 auto;
+}
+
+.live-thinking-row .active-work-log {
   width: 100%;
-  max-height: 210px;
-  overflow-y: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 .spinner {
@@ -1028,22 +1117,6 @@ dialog::backdrop {
   to {
     transform: rotate(360deg);
   }
-}
-
-.thinking-text {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 13px;
-}
-
-.thinking-text strong {
-  color: var(--text);
-}
-
-.thinking-text span {
-  color: var(--faint);
-  font-size: 12px;
 }
 
 .approve-banner,
@@ -1593,6 +1666,91 @@ select:focus {
   background: color-mix(in srgb, var(--agent-color) 13%, rgba(255, 255, 255, 0.04));
 }
 
+.role-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.role-row {
+  display: grid;
+  grid-template-columns: minmax(0, 92px) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.role-row > span {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.role-row img {
+  width: 21px;
+  height: 21px;
+  object-fit: contain;
+}
+
+.role-row select {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  font-size: 11px;
+}
+
+.role-row.off {
+  opacity: 0.52;
+}
+
+.role-save-button {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.role-note {
+  margin: 7px 0 0;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.role-dialog {
+  width: min(520px, calc(100vw - 24px));
+  max-height: min(720px, calc(100dvh - 24px));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.role-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.role-dialog-body {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.role-dialog .role-row {
+  grid-template-columns: 124px minmax(0, 1fr);
+}
+
+.role-dialog-save {
+  width: 100%;
+}
+
+@media (max-width: 520px) {
+  .role-dialog .role-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+}
+
 .empty-state {
   text-align: center;
   color: var(--faint);
@@ -1625,11 +1783,15 @@ select:focus {
   .app-shell {
     display: flex;
     flex-direction: column;
+    width: 100%;
+    max-width: 100vw;
     height: 100dvh;
   }
 
   .sidebar {
     width: 100%;
+    max-width: 100vw;
+    min-width: 0;
     height: auto;
     max-height: 218px;
     flex: 0 0 auto;
@@ -1640,11 +1802,13 @@ select:focus {
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-rows: auto auto minmax(58px, auto);
     gap: 8px;
+    position: relative;
   }
 
   .brand {
     min-width: 0;
     padding: 0;
+    padding-right: 44px;
   }
 
   .brand p,
@@ -1653,8 +1817,19 @@ select:focus {
   }
 
   .new-session {
-    width: auto;
-    align-self: center;
+    position: absolute;
+    top: 9px;
+    right: 10px;
+    width: 34px;
+    min-height: 34px;
+    padding: 0;
+    font-size: 0;
+  }
+
+  .new-session svg {
+    width: 16px;
+    height: 16px;
+    margin: 0;
   }
 
   .session-list {
@@ -1669,12 +1844,16 @@ select:focus {
 
   .session-tools {
     grid-column: 1 / -1;
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 0;
   }
 
   .session-tools input[type="search"] {
-    grid-column: auto;
+    grid-column: 1 / -1;
+  }
+
+  .session-tools label {
+    min-width: 0;
   }
 
   .session-item {
@@ -1685,6 +1864,8 @@ select:focus {
 
   .thread {
     width: 100%;
+    max-width: 100vw;
+    min-width: 0;
     height: auto;
     flex: 1 1 auto;
     min-height: 0;
@@ -1695,7 +1876,40 @@ select:focus {
   .thread-header {
     min-height: 58px;
     padding: 10px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     align-items: center;
+  }
+
+  .thread-header .thread-identity {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+
+  .thread-header .header-state {
+    grid-column: 1;
+    grid-row: 2;
+    justify-items: start;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+  }
+
+  .thread-header > .icon-button {
+    grid-row: 2;
+  }
+
+  .thread-header > .icon-button:nth-of-type(1) {
+    grid-column: 2;
+  }
+
+  .thread-header > .icon-button:nth-of-type(2) {
+    grid-column: 3;
+  }
+
+  .header-state .status-pill {
+    max-width: 118px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .thread-header h2 {
@@ -1768,6 +1982,15 @@ select:focus {
     overflow-y: auto;
   }
 
+  .composer,
+  .message-box,
+  .approval-input,
+  .message-box > textarea,
+  .approval-input > textarea {
+    min-width: 0;
+    max-width: 100%;
+  }
+
   .composer-actions {
     flex-wrap: nowrap;
     overflow-x: auto;
@@ -1786,6 +2009,22 @@ select:focus {
       "targets targets"
       "input send";
     align-items: center;
+  }
+
+  .message-box {
+    grid-template-columns: minmax(0, 1fr) 42px;
+  }
+
+  .message-box > button {
+    width: 42px;
+    padding: 0;
+    font-size: 0;
+  }
+
+  .message-box > button svg {
+    width: 16px;
+    height: 16px;
+    margin: 0;
   }
 
   .message-box textarea,

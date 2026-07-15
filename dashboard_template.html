@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TriAgent Control</title>
-<link rel="stylesheet" href="/static/dashboard.css">
+<link rel="stylesheet" href="/static/dashboard.css?v=20260715-responsive-test">
 </head>
 <body>
 <div class="app-shell">
@@ -16,7 +16,7 @@
         <p>Three-model control center</p>
       </div>
     </div>
-    <button class="new-session" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>새 세션</button>
+    <button class="new-session" onclick="restartSession()" title="새 세션" aria-label="새 세션"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>새 세션</button>
     <div class="session-tools">
       <input id="sessionSearch" type="search" placeholder="세션 검색" oninput="applySessionFilters()">
       <label><input id="favoriteOnly" type="checkbox" onchange="applySessionFilters()"> 즐겨찾기</label>
@@ -44,7 +44,13 @@
           </div>
         </div>
       </div>
-      <div class="status-pill" id="status">__STATUS__</div>
+      <div class="header-state">
+        <div class="mode-pill" id="headerMode">준비</div>
+        <div class="status-pill" id="status">__STATUS__</div>
+      </div>
+      <button class="icon-button" onclick="openRoleDialog()" title="모델 역할 설정" aria-label="모델 역할 설정">
+        <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-7 8v-1c0-2.76 3.13-5 7-5s7 2.24 7 5v1H5zm14.5-8.5V9H17V7h2.5V4.5h2V7H24v2h-2.5v2.5h-2z"/></svg>
+      </button>
       <button class="icon-button" onclick="enableNotifications()" title="알림 설정" aria-label="알림 설정"><svg viewBox="0 0 24 24"><path d="M12 22a2 2 0 002-2h-4a2 2 0 002 2zm6-6v-5a6 6 0 00-5-5.91V4a1 1 0 10-2 0v1.09A6 6 0 006 11v5l-2 2v1h16v-1l-2-2z"/></svg></button>
     </header>
 
@@ -61,12 +67,6 @@
     <div class="conversation-scroll" id="conversationScroll">
       <section id="topicSection">__TOPIC_SECTION__</section>
       <section class="feed" id="feed">__FEED__</section>
-
-      <section id="thinkingIndicator" class="thinking-card" style="display:none">
-        <div class="spinner"></div>
-        <div class="thinking-text">생각 중...</div>
-        <ol class="active-work-log" id="activeWorkLog"></ol>
-      </section>
 
       <section class="approve-banner" id="approveBanner" style="display:none">
         <p id="approveHint">위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
@@ -103,8 +103,15 @@
         <select id="composerModeSelect" aria-label="채팅 모드">
           <option value="discussion">토론 모드</option>
           <option value="coding">코딩 모드</option>
+          <option value="continuous">무제한 코딩</option>
         </select>
         <button class="ghost" onclick="changeSessionMode('composer')">모드 전환</button>
+        <select id="composerDiscussionAccess" aria-label="토론 프로젝트 접근">
+          <option value="read">프로젝트 읽기</option>
+          <option value="write">프로젝트 읽기·쓰기</option>
+          <option value="none">읽지 않고 토론</option>
+        </select>
+        <button class="ghost" id="composerDiscussionAccessButton" onclick="changeDiscussionAccess('composer')">토론 접근 적용</button>
       </div>
       <div class="message-box">
         <select id="interventionIntent" aria-label="개입 유형" __NO_TOPIC__>
@@ -142,12 +149,25 @@
         <span>모드</span>
         <strong id="sideMode">-</strong>
       </div>
+      <div class="metric-row" id="sideCycleRow" style="display:none">
+        <span>반복</span>
+        <strong id="sideCycle">사이클 1</strong>
+      </div>
       <div class="mode-switcher">
         <select id="sessionModeSelect" aria-label="세션 모드">
           <option value="discussion">토론 모드</option>
           <option value="coding">코딩 모드</option>
+          <option value="continuous">무제한 코딩</option>
         </select>
         <button class="ghost compact" onclick="changeSessionMode()">전환</button>
+      </div>
+      <div class="mode-switcher discussion-access-switcher">
+        <select id="discussionAccessSelect" aria-label="일반 토론 프로젝트 접근">
+          <option value="read">프로젝트 읽기</option>
+          <option value="write">프로젝트 읽기·쓰기</option>
+          <option value="none">읽지 않고 토론</option>
+        </select>
+        <button class="ghost compact" id="discussionAccessButton" onclick="changeDiscussionAccess()">적용</button>
       </div>
       <div class="metric-row">
         <span>메시지</span>
@@ -201,10 +221,18 @@
       <div class="agent-stack" id="agentStack"></div>
     </div>
 
+    <div class="inspector-card role-card">
+      <div class="card-title">Roles</div>
+      <div class="role-controls" id="roleControls"></div>
+      <button class="ghost compact role-save-button" id="roleSaveButton" onclick="saveAgentRoles()">역할 적용</button>
+      <p class="role-note">중복 배정 불가 · 실행 중 변경 불가</p>
+    </div>
+
     <div class="inspector-card">
       <div class="card-title">Memory</div>
       <p class="memory-path" id="memoryPath">세션 시작 후 표시됩니다.</p>
       <p class="memory-path" id="profilePath">Profile.md도 여기에 표시됩니다.</p>
+      <p class="memory-path" id="rolesPath">Roles.md도 여기에 표시됩니다.</p>
       <button class="ghost compact" onclick="openProfileEditor()">Profile.md 열기</button>
       <div class="profile-editor" id="profileEditor" style="display:none">
         <textarea id="profileContent" spellcheck="false"></textarea>
@@ -237,6 +265,14 @@
   <div class="preview-controls"><select id="previewAgent" onchange="loadPromptPreview()"><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="claude">Claude Code</option></select><span id="previewStats"></span></div>
   <pre id="promptPreviewText"></pre>
 </dialog>
+<dialog id="roleDialog" class="role-dialog">
+  <div class="dialog-header"><strong>모델 역할 설정</strong><button class="icon-button" onclick="closeRoleDialog()" aria-label="닫기">×</button></div>
+  <div class="role-dialog-body">
+    <div class="role-controls" id="roleDialogControls"></div>
+    <p class="role-note">역할은 사용자가 변경하기 전까지 강제됩니다. 같은 역할은 중복 배정할 수 없습니다.</p>
+    <button class="role-dialog-save" id="roleDialogSaveButton" onclick="saveAgentRoles('dialog')">역할 적용</button>
+  </div>
+</dialog>
 <dialog id="tokenDetailsDialog" class="token-details-dialog">
   <div class="dialog-header"><strong>모델별 토큰 상세</strong><button class="icon-button" onclick="closeTokenDetails()" aria-label="닫기">×</button></div>
   <p class="token-details-summary" id="tokenDetailsSummary"></p>
@@ -250,6 +286,6 @@
   <div class="dialog-actions"><button onclick="saveSessionMeta()">저장</button><button class="ghost" onclick="renameManagedSession()">이름 수정</button><button class="ghost" onclick="cloneManagedSession()">분기</button><button class="danger" onclick="deleteManagedSession()">삭제</button></div>
 </dialog>
 
-<script src="/static/dashboard.js"></script>
+<script src="/static/dashboard.js?v=20260715-responsive-test"></script>
 </body>
 </html>

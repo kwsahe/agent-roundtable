@@ -38,6 +38,7 @@ TriAgent Control — Codex, Antigravity & Claude Code
 import html
 import inspect
 import difflib
+import fnmatch
 import json
 import locale
 import math
@@ -48,6 +49,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -69,11 +71,13 @@ LOG_PATH = ROOT / "roundtable_log.md"
 SESSIONS_DIR = ROOT / "sessions"
 MEMORY_DIR = ROOT / "roundtable_memory"
 TEAM_PROMPT_PATH = ROOT / "TEAM_PROMPT.md"
+ROLE_POLICY_PATH = ROOT / "ROLE_POLICY.md"
 PROFILE_PATHS = {
     "codex": ROOT / "CODEX_Profile.md",
     "antigravity": ROOT / "ANTIGRAVITY_Profile.md",
     "claude": ROOT / "CLAUDE_Profile.md",
 }
+NO_PROJECT_DIR = Path(tempfile.gettempdir()) / "triagent-control-chat-only"
 
 ACTIVE_PROCESS_LOCK = threading.Lock()
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
@@ -298,6 +302,7 @@ AGENTS = {
     "antigravity": {"label": "Antigravity", "color": "#a66cff", "side": "center", "avatar": "/static/agents/antigravity.png"},
     "claude": {"label": "Claude Code", "color": "#ff8a3d", "side": "right", "avatar": "/static/agents/claude.svg"},
     "user": {"label": "나 (개입)", "color": "#42c991", "side": "center", "avatar": "/static/agents/user.svg"},
+    "system": {"label": "TriAgent Control", "color": "#8b95a7", "side": "center", "avatar": ""},
 }
 
 MODEL_CATALOG = {
@@ -422,8 +427,211 @@ CODING_REPORT_STEP = (
     "discussion",
 )
 
+CONTINUOUS_CODING_STEPS = [
+    ("codex", "개발 진행",
+     "현재 프로젝트 상태, 최근 교차 검토와 통합 결론을 먼저 확인해. 아직 완성되지 않은 항목 중 가장 중요한 담당 작업을 "
+     "계획 보고로 끝내지 말고 실제 코드로 구현해. 기존 변경과 충돌하지 않게 수정하고 가능한 검증을 실행한 뒤 변경 파일과 결과만 간결하게 보고해.",
+     "coding"),
+    ("antigravity", "개발 진행",
+     "Codex가 방금 반영한 내용과 최근 교차 검토를 확인해. 중복을 피하면서 프로젝트 완성도를 가장 크게 높일 담당 작업을 "
+     "실제 코드로 구현하고 검증해. 변경 파일, 구현 결과와 남은 위험만 간결하게 보고해.", "coding"),
+    ("claude", "개발 진행",
+     "Codex와 Antigravity가 이번 사이클에 반영한 변경과 최근 통합 결론을 확인해. 빠진 구현이나 연결 작업을 실제 코드로 "
+     "완료하고 검증해. 변경 파일, 구현 결과와 남은 위험만 간결하게 보고해.", "coding"),
+    ("codex", "교차 검토",
+     "이번 사이클의 세 모델 변경과 자동 검증 결과를 읽기 전용으로 검토해. 실제 사용자 요구 대비 결함, 미완성 기능, 회귀 위험, "
+     "누락 테스트를 우선순위로 정리하고 다음 사이클에서 반드시 고칠 항목을 제안해. 파일은 수정하지 마.", "discussion"),
+    ("antigravity", "교차 검토",
+     "이번 사이클 변경과 Codex 검토 의견을 프로젝트 파일에 대조해. 동의하지 않는 부분은 반박하고, 놓친 결함과 다음 구현 우선순위를 "
+     "구체적으로 제안해. 파일은 수정하지 마.", "discussion"),
+    ("claude", "교차 검토",
+     "이번 사이클 변경, 자동 검증, 두 모델의 검토 의견을 프로젝트 파일에 대조해. 사용자 경험과 전체 연결 관점에서 남은 결함과 "
+     "다음 구현 우선순위를 제안해. 파일은 수정하지 마.", "discussion"),
+]
+
+
+def continuous_coding_steps(enabled_agents: list[str]) -> list[tuple[str, str, str, str]]:
+    enabled = normalize_enabled_agents(enabled_agents)
+    steps = [step for step in CONTINUOUS_CODING_STEPS if step[0] in enabled]
+    reporter = reporter_for(enabled)
+    steps.append((
+        reporter,
+        "토론 결과 통합",
+        "이번 사이클의 구현, 자동 검증과 세 모델 검토 의견을 하나의 결론으로 통합해. 의견 충돌을 정리하고 다음 사이클에서 "
+        "각 모델이 실제로 구현할 우선순위를 명확히 지정해. 프로젝트가 충분히 완성됐다고 판단해도 사용자가 중단하기 전까지 "
+        "품질, 테스트, 접근성, 성능과 운영 완성도를 다시 점검할 다음 작업을 선정해. 파일은 수정하지 마.",
+        "discussion",
+    ))
+    return steps
+
 
 AGENT_ORDER = ["codex", "antigravity", "claude"]
+
+ROLE_CATALOG = {
+    "architect": {
+        "label": "시스템 설계자",
+        "summary": "구조, 경계, 인터페이스와 기술 결정을 설계합니다.",
+        "scope": "설계 문서와 ADR",
+        "can_write": True,
+        "patterns": ["*.md", "docs/**", "adr/**"],
+    },
+    "backend": {
+        "label": "백엔드 개발자",
+        "summary": "서버 로직, API, 데이터 저장소와 마이그레이션을 담당합니다.",
+        "scope": "백엔드 코드와 설정",
+        "can_write": True,
+        "patterns": ["*.py", "*.go", "*.java", "*.cs", "*.rb", "*.php", "backend/**", "server/**", "api/**", "db/**", "migrations/**", "config/**"],
+    },
+    "frontend": {
+        "label": "프론트엔드 개발자",
+        "summary": "화면, 컴포넌트, 스타일과 사용자 상호작용을 구현합니다.",
+        "scope": "템플릿과 프론트엔드 코드",
+        "can_write": True,
+        "patterns": ["*.html", "*.css", "*.js", "*.ts", "*.jsx", "*.tsx", "*.vue", "*.svelte", "templates/**", "static/**", "frontend/**", "client/**", "web/**"],
+    },
+    "ux": {
+        "label": "UX·접근성 담당",
+        "summary": "사용 흐름, 반응형 화면, 키보드와 스크린리더 접근성을 개선합니다.",
+        "scope": "UI와 접근성 관련 파일",
+        "can_write": True,
+        "patterns": ["*.html", "*.css", "*.js", "*.ts", "*.jsx", "*.tsx", "templates/**", "static/**", "frontend/**", "client/**", "web/**"],
+    },
+    "qa": {
+        "label": "QA·테스트 담당",
+        "summary": "테스트, 재현 절차, 회귀 검증과 품질 기준을 담당합니다.",
+        "scope": "테스트 코드와 테스트 설정",
+        "can_write": True,
+        "patterns": ["tests/**", "test/**", "spec/**", "test_*.py", "*_test.*", "*.spec.*", "*.test.*", "pytest.ini", "tox.ini", "playwright.config.*", "vitest.config.*", "jest.config.*"],
+    },
+    "reviewer": {
+        "label": "코드 리뷰어",
+        "summary": "변경 사항의 결함, 회귀 위험과 누락된 테스트를 검토합니다.",
+        "scope": "읽기 전용 검토",
+        "can_write": False,
+        "patterns": [],
+    },
+    "security": {
+        "label": "보안 담당",
+        "summary": "인증, 권한, 입력 검증, 비밀정보와 취약점을 점검합니다.",
+        "scope": "보안·인증 코드와 보안 테스트",
+        "can_write": True,
+        "patterns": ["**/auth*", "**/security*", "**/permission*", "**/secret*", "tests/security/**", "tests/auth/**", "config/**", ".env.example"],
+    },
+    "ai_data": {
+        "label": "AI·데이터 담당",
+        "summary": "모델 연동, 프롬프트, 데이터 처리와 분석 로직을 담당합니다.",
+        "scope": "AI·데이터·분석 코드",
+        "can_write": True,
+        "patterns": ["ai/**", "ml/**", "data/**", "prompts/**", "**/llm*", "**/model*", "**/analysis*", "*.ipynb"],
+    },
+    "devops": {
+        "label": "DevOps 담당",
+        "summary": "빌드, 배포, CI, 컨테이너와 운영 설정을 담당합니다.",
+        "scope": "인프라와 자동화 설정",
+        "can_write": True,
+        "patterns": [".github/**", ".gitlab-ci.yml", "Dockerfile*", "docker-compose*", "compose*.yml", "infra/**", "deploy/**", "scripts/**", "Makefile", "*.toml", "*.yaml", "*.yml"],
+    },
+    "performance": {
+        "label": "성능 담당",
+        "summary": "병목 측정, 캐시, 쿼리와 렌더링 성능을 개선합니다.",
+        "scope": "성능 관련 코드와 벤치마크",
+        "can_write": True,
+        "patterns": ["benchmarks/**", "benchmark/**", "perf/**", "*.py", "*.go", "*.java", "*.js", "*.ts", "*.css", "*.html", "backend/**", "server/**", "frontend/**", "static/**", "templates/**"],
+    },
+    "product": {
+        "label": "제품 기획자",
+        "summary": "요구사항, 우선순위, 수용 기준과 사용자 흐름을 정리합니다.",
+        "scope": "기획 문서",
+        "can_write": True,
+        "patterns": ["*.md", "docs/**", "product/**", "requirements/**"],
+    },
+    "docs": {
+        "label": "문서 담당",
+        "summary": "README, 사용법, 운영 문서와 변경 기록을 정리합니다.",
+        "scope": "문서 파일",
+        "can_write": True,
+        "patterns": ["*.md", "docs/**", "CHANGELOG*", "LICENSE*"],
+    },
+    "coordinator": {
+        "label": "통합 조정자",
+        "summary": "모델 간 작업 분배, 충돌 조정과 최종 결과 통합을 담당합니다.",
+        "scope": "읽기 전용 조정",
+        "can_write": False,
+        "patterns": [],
+    },
+}
+
+
+def normalize_agent_roles(roles: dict | None) -> dict:
+    source = roles if isinstance(roles, dict) else {}
+    return {
+        agent: source.get(agent, "") if source.get(agent, "") in ROLE_CATALOG else ""
+        for agent in AGENT_ORDER
+    }
+
+
+def role_label(role_id: str) -> str:
+    return ROLE_CATALOG.get(role_id, {}).get("label", "미지정")
+
+
+ROLE_SELECTION_RE = re.compile(r"(?im)^\s*ROLE_SELECT\s*:\s*([a-z_]+)\s*$")
+ROLE_PREFERENCES = {
+    "codex": ["backend", "architect", "ai_data", "performance", "security"],
+    "antigravity": ["qa", "reviewer", "ux", "security", "devops"],
+    "claude": ["frontend", "product", "architect", "docs", "coordinator"],
+}
+
+
+def role_choice_instruction() -> str:
+    choices = ", ".join(f"{role_id}={role['label']}" for role_id, role in ROLE_CATALOG.items())
+    return (
+        "\n\n대화로 역할을 조율한 뒤 다음 선택지에서 네 역할 하나를 직접 선택해. "
+        f"선택지: {choices}. 이미 다른 모델이 선택한 역할은 고르지 마. "
+        "답변 마지막 줄에는 반드시 `ROLE_SELECT: 역할_ID` 형식만 적어. "
+        "이 값은 대시보드 역할 선택지와 Roles.md에 자동 저장된다."
+    )
+
+
+def extract_role_selection(text: str) -> str:
+    match = ROLE_SELECTION_RE.search(text or "")
+    if match and match.group(1) in ROLE_CATALOG:
+        return match.group(1)
+    return ""
+
+
+def strip_role_selection(text: str) -> str:
+    return ROLE_SELECTION_RE.sub("", text or "").strip()
+
+
+def choose_discussion_role(agent: str, requested_role: str = "") -> str:
+    with STATE_LOCK:
+        roles = normalize_agent_roles(STATE.get("agent_roles"))
+        used = {role for owner, role in roles.items() if owner != agent and role}
+        candidates = [requested_role] if requested_role in ROLE_CATALOG else []
+        candidates.extend(ROLE_PREFERENCES.get(agent, []))
+        candidates.extend(ROLE_CATALOG)
+        selected = next((role for role in candidates if role and role not in used), "")
+        previous = roles.get(agent, "")
+        if not selected or selected == previous:
+            return selected
+        roles[agent] = selected
+        STATE["agent_roles"] = roles
+        STATE.setdefault("role_history", []).append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "agent": agent,
+            "from": previous,
+            "to": selected,
+            "source": "discussion_auto",
+        })
+        del STATE["role_history"][:-100]
+        save_state(STATE)
+        snapshot = dict(STATE)
+    write_session_roles(snapshot)
+    add_runtime_event(
+        f"역할 토론 자동 선택: {AGENTS[agent]['label']}={role_label(selected)}"
+        + ("" if requested_role == selected else " (남은 선택지로 자동 보정)")
+    )
+    return selected
 
 
 def normalize_agent_settings(settings: dict | None) -> dict:
@@ -458,6 +666,34 @@ def agent_setting_label(agent: str, settings: dict | None) -> str:
 def selected_agent_setting(agent: str) -> dict:
     state = globals().get("STATE", {})
     return normalize_agent_settings(state.get("agent_settings", {}))[agent]
+
+
+def normalize_discussion_project_access(value: str | None) -> str:
+    return value if value in {"none", "read", "write"} else "read"
+
+
+def discussion_project_access_label(value: str | None) -> str:
+    return {
+        "write": "프로젝트 읽기·쓰기",
+        "read": "프로젝트 읽기",
+        "none": "읽지 않고 토론",
+    }[normalize_discussion_project_access(value)]
+
+
+def turn_project_access(cli_mode: str, state: dict | None = None) -> str:
+    current = state if isinstance(state, dict) else globals().get("STATE", {})
+    if cli_mode == "coding":
+        return "write"
+    if current.get("mode") in {"coding", "continuous"}:
+        return "write"
+    return normalize_discussion_project_access(current.get("discussion_project_access"))
+
+
+def cli_working_directory(cli_mode: str) -> Path:
+    if turn_project_access(cli_mode) != "none":
+        return load_project_path()
+    NO_PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+    return NO_PROJECT_DIR
 
 
 def normalize_enabled_agents(enabled_agents: list[str] | None) -> list[str]:
@@ -504,7 +740,13 @@ def make_confirm_step(enabled_agents: list[str]) -> tuple[str, str, str, str]:
 
 def steps_for_mode(mode: str, enabled_agents: list[str] | None = None) -> list[tuple[str, str, str, str]]:
     enabled = normalize_enabled_agents(enabled_agents)
-    discussion_steps = [step for step in DISCUSSION_STEPS if step[0] in enabled]
+    if mode == "continuous":
+        return continuous_coding_steps(enabled)
+    discussion_steps = [
+        (agent, phase, instruction + (role_choice_instruction() if phase in {"역할 선언", "역할 확정"} else ""), cli_mode)
+        for agent, phase, instruction, cli_mode in DISCUSSION_STEPS
+        if agent in enabled
+    ]
     if mode == "coding":
         proposal_steps = [step for step in PROPOSAL_STEPS if step[0] in enabled and step[1] != CONFIRM_PHASE]
         coding_steps = [step for step in CODING_WORK_STEPS if step[0] in enabled]
@@ -970,7 +1212,8 @@ def is_incomplete_tool_response(text: str) -> bool:
 
 
 def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str:
-    sandbox = "workspace-write" if mode == "coding" else "read-only"
+    project_access = turn_project_access(mode)
+    sandbox = "workspace-write" if project_access == "write" else "read-only"
     setting = selected_agent_setting("codex")
     args = ["exec", "--ephemeral", "--ignore-user-config"]
     if mode == "discussion":
@@ -985,7 +1228,7 @@ def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str
         CODEX_CMD,
         args,
         timeout=CODEX_TIMEOUT,
-        cwd=load_project_path(),
+        cwd=cli_working_directory(mode),
         input_text=prompt,
         stream_events=True,
         event_callback=event_callback,
@@ -994,7 +1237,8 @@ def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str
 
 
 def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> str:
-    permission_mode = "acceptEdits" if mode == "coding" else "dontAsk"
+    project_access = turn_project_access(mode)
+    permission_mode = "acceptEdits" if project_access == "write" else "dontAsk"
     setting = selected_agent_setting("claude")
     args = ["--print", "--safe-mode", "--no-session-persistence"]
     if setting["model"]:
@@ -1007,12 +1251,18 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
     if cost_limit:
         remaining = max(0.01, cost_limit - float(state.get("total_actual_cost_usd", 0.0) or 0.0))
         args.extend(["--max-budget-usd", f"{remaining:.4f}"])
-    if mode == "discussion":
-        args.extend(["--tools", ""])
+    if project_access != "write":
+        tools = "Read,Glob,Grep" if project_access == "read" else ""
+        args.extend(["--tools", tools])
+        access_instruction = (
+            "Inspect only the relevant project files with Read, Glob, and Grep before answering. "
+            if project_access == "read" else
+            "Do not inspect files or call tools. Use only the conversation context in the prompt. "
+        )
         args.extend([
             "--system-prompt",
-            "You are the Claude participant in a controlled roundtable. Never call, request, or announce tools. "
-            "Do not inspect files, enter plan mode, mention plan files, or request ExitPlanMode. "
+            "You are the Claude participant in a controlled roundtable. " + access_instruction +
+            "Do not enter plan mode, mention plan files, or request ExitPlanMode. "
             "Return only a complete final answer in Korean, with no Tool: markers.",
         ])
     else:
@@ -1023,12 +1273,12 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
         CLAUDE_CMD,
         args,
         timeout=CLAUDE_TIMEOUT,
-        cwd=load_project_path(),
+        cwd=cli_working_directory(mode),
         stream_events=True,
         event_callback=event_callback,
     )
     text = _finalize_cli_result("Claude Code", result)
-    if mode == "discussion" and is_incomplete_tool_response(text):
+    if project_access != "write" and is_incomplete_tool_response(text):
         if event_callback:
             event_callback({"kind": "status", "text": "불완전한 도구 요청 응답 감지 · 자동 교정 재시도"})
         retry_args = list(args)
@@ -1038,7 +1288,7 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
         )
         retry_result = run_cli(
             "Claude Code", CLAUDE_CMD, retry_args, timeout=CLAUDE_TIMEOUT,
-            cwd=load_project_path(), stream_events=True, event_callback=event_callback,
+            cwd=cli_working_directory(mode), stream_events=True, event_callback=event_callback,
         )
         text = _finalize_cli_result("Claude Code", retry_result)
     return text
@@ -1048,12 +1298,13 @@ def ask_antigravity(prompt: str, mode: str = "discussion", event_callback=None) 
     # agy는 Go 스타일 플래그라 --print 자체가 프롬프트 값을 먹는다. 반드시 마지막에 와야 함.
     # subprocess의 cwd만으로는 agy가 프로젝트 폴더를 인식하지 못하고 자기 내부의 기본
     # scratch 워크스페이스를 본다 — --add-dir로 명시적으로 작업 폴더를 알려줘야 한다.
-    project_path = load_project_path()
-    base_args = ["--add-dir", str(project_path)]
+    project_access = turn_project_access(mode)
+    project_path = cli_working_directory(mode)
+    base_args = ["--add-dir", str(project_path)] if project_access != "none" else []
     setting = selected_agent_setting("antigravity")
     if setting["model"]:
         base_args.extend(["--model", setting["model"]])
-    if mode == "coding":
+    if project_access == "write":
         args = base_args + ["--mode", "accept-edits", "--print", prompt]
     else:
         args = base_args + ["--mode", "plan", "--sandbox", "--print", prompt]
@@ -1092,8 +1343,12 @@ def new_state() -> dict:
         "finished": False,
         "topic": "",
         "mode": "discussion",
+        "discussion_project_access": "read",
         "enabled_agents": list(AGENT_ORDER),
         "agent_settings": normalize_agent_settings(None),
+        "agent_roles": normalize_agent_roles(None),
+        "role_history": [],
+        "roles_announced_signature": "",
         "workspace_path": str(load_project_path()),
         "workspace_access": "write",
         "total_est_tokens": 0,
@@ -1113,6 +1368,7 @@ def new_state() -> dict:
         "delegation_count": 0,
         "delegation_history": [],
         "pending_interventions": [],
+        "continuous_stopped": False,
     }
 
 
@@ -1125,13 +1381,23 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("archived", False)
     state["tags"] = [str(tag).strip()[:24] for tag in state["tags"] if str(tag).strip()][:8]
     state.setdefault("messages", [])
+    state["messages"] = [
+        message for message in state["messages"]
+        if (message.get("meta") or {}).get("failure_kind") != "role_unassigned"
+    ]
     state.setdefault("step_index", 0)
     state.setdefault("finished", False)
     state.setdefault("topic", "")
     state.setdefault("mode", "discussion")
+    state["discussion_project_access"] = normalize_discussion_project_access(
+        state.get("discussion_project_access")
+    )
     state.setdefault("workspace_path", str(load_project_path()))
     state.setdefault("workspace_access", "write")
     state["workspace_access"] = "write" if state.get("workspace_access") == "write" else "read"
+    if state.get("mode") in {"coding", "continuous"}:
+        state["discussion_project_access"] = "write"
+        state["workspace_access"] = "write"
     state.setdefault("total_est_tokens", 0)
     state.setdefault("total_actual_tokens", 0)
     state.setdefault("total_actual_cost_usd", 0.0)
@@ -1154,8 +1420,14 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("delegation_count", 0)
     state.setdefault("delegation_history", [])
     state.setdefault("pending_interventions", [])
+    state["continuous_stopped"] = bool(state.get("continuous_stopped", False))
     state["enabled_agents"] = normalize_enabled_agents(state.get("enabled_agents"))
     state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
+    state["agent_roles"] = normalize_agent_roles(state.get("agent_roles"))
+    state.setdefault("role_history", [])
+    if not isinstance(state["role_history"], list):
+        state["role_history"] = []
+    state.setdefault("roles_announced_signature", "")
     return state
 
 
@@ -1203,6 +1475,9 @@ def list_sessions() -> list[dict]:
             "favorite": bool(data.get("favorite", False)),
             "archived": bool(data.get("archived", False)),
             "mode": data.get("mode", "discussion"),
+            "discussion_project_access": normalize_discussion_project_access(
+                data.get("discussion_project_access")
+            ),
             "enabled_agents": normalize_enabled_agents(data.get("enabled_agents")),
             "agent_settings": normalize_agent_settings(data.get("agent_settings")),
             "finished": data.get("finished", False),
@@ -1252,6 +1527,48 @@ def session_profile_path(session_id: str) -> Path:
     return session_memory_dir(session_id) / "Profile.md"
 
 
+def session_roles_path(session_id: str) -> Path:
+    return session_memory_dir(session_id) / "Roles.md"
+
+
+def write_session_roles(state: dict) -> None:
+    session_id = state.get("id", "")
+    if not session_id:
+        return
+    memory_dir = session_memory_dir(session_id)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    roles = normalize_agent_roles(state.get("agent_roles"))
+    enabled = set(normalize_enabled_agents(state.get("enabled_agents")))
+    lines = [
+        f"# 세션 역할 - {state.get('name') or state.get('topic') or session_id}",
+        "",
+        f"- 세션 ID: {session_id}",
+        f"- 전역 정책: {ROLE_POLICY_PATH}",
+        "",
+        "## 현재 배정",
+        "",
+        "| 모델 | 상태 | 역할 | 담당 범위 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for agent in AGENT_ORDER:
+        role = ROLE_CATALOG.get(roles[agent], {})
+        lines.append(
+            f"| {AGENTS[agent]['label']} | {'활성' if agent in enabled else '꺼짐'} | "
+            f"{role.get('label', '미지정')} | {role.get('scope', '-')} |"
+        )
+    lines.extend(["", "## 변경 이력", ""])
+    history = state.get("role_history", [])[-100:]
+    if history:
+        for entry in history:
+            lines.append(
+                f"- [{entry.get('time', '')}] {AGENTS.get(entry.get('agent'), {}).get('label', entry.get('agent', ''))}: "
+                f"{role_label(entry.get('from', ''))} -> {role_label(entry.get('to', ''))}"
+            )
+    else:
+        lines.append("- 아직 사용자가 확정한 역할이 없습니다.")
+    session_roles_path(session_id).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def session_agent_profile_dir(session_id: str) -> Path:
     return session_memory_dir(session_id) / "profiles"
 
@@ -1272,10 +1589,12 @@ def write_session_transcript_header(state: dict) -> None:
     if path.exists():
         return
     mode_label = MODE_LABELS.get(state.get("mode", "discussion"), state.get("mode", ""))
+    discussion_access_label = discussion_project_access_label(state.get("discussion_project_access"))
     path.write_text(
         f"# 세션 기록 — {state.get('topic', '')}\n\n"
         f"- 세션 ID: {state['id']}\n"
         f"- 모드: {mode_label}\n"
+        f"- 일반 토론 프로젝트 접근: {discussion_access_label}\n"
         f"- 시작: {state.get('created_at', '')}\n",
         encoding="utf-8",
     )
@@ -1289,12 +1608,14 @@ def ensure_session_memory(state: dict) -> None:
     profile_dir = session_agent_profile_dir(session_id)
     profile_dir.mkdir(parents=True, exist_ok=True)
     mode_label = MODE_LABELS.get(state.get("mode", "discussion"), state.get("mode", ""))
+    discussion_access_label = discussion_project_access_label(state.get("discussion_project_access"))
     enabled = normalize_enabled_agents(state.get("enabled_agents"))
     disabled = [a for a in AGENT_ORDER if a not in enabled]
     header = (
         f"# Roundtable Memory — {state.get('topic', '')}\n\n"
         f"- 세션 ID: {session_id}\n"
         f"- 모드: {mode_label}\n"
+        f"- 일반 토론 프로젝트 접근: {discussion_access_label}\n"
         f"- 활성 에이전트: {agent_names(enabled)}\n"
         f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}\n"
         f"- 시작: {state.get('created_at', '')}\n"
@@ -1304,8 +1625,10 @@ def ensure_session_memory(state: dict) -> None:
     if not brief_path.exists():
         brief_path.write_text(header + "\n## 압축 요약\n", encoding="utf-8")
     profile_path = session_profile_path(session_id)
+    roles_path = session_roles_path(session_id)
     if not profile_path.exists():
         profile_path.write_text(SESSION_PROFILE_TEMPLATE, encoding="utf-8")
+    write_session_roles(state)
     for agent in AGENT_ORDER:
         path = session_agent_profile_path(session_id, agent)
         if not path.exists():
@@ -1456,32 +1779,52 @@ def read_brief_tail(session_id: str, max_lines: int = MEMORY_BRIEF_LINES) -> str
     return "\n".join(bullet_lines[-max_lines:])
 
 
-def build_memory_context(state: dict) -> str:
+def build_memory_context(state: dict, expose_file_paths: bool = True) -> str:
     session_id = state.get("id", "")
     if not session_id:
         return ""
     ensure_session_memory(state)
     full_path, brief_path = session_memory_paths(session_id)
     profile_path = session_profile_path(session_id)
+    roles_path = session_roles_path(session_id)
     enabled = normalize_enabled_agents(state.get("enabled_agents"))
     disabled = [a for a in AGENT_ORDER if a not in enabled]
     brief_tail = read_brief_tail(session_id)
-    lines = [
-        "세션 외부 메모리 (필요할 때만 파일을 직접 읽기):",
-        f"- 전체 기록 파일: {full_path}",
-        f"- 압축 요약 파일: {brief_path}",
-        f"- 세션 역할 프로필: {profile_path}",
-        f"- 활성 에이전트: {agent_names(enabled)}",
-        f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}",
-        "",
-        "규칙:",
-        "- 전체 기록과 Profile.md 전문은 현재 프롬프트에 포함되지 않았다.",
-        "- 역할 결정이나 과거 근거가 꼭 필요할 때만 해당 파일을 직접 읽는다.",
-        "- 역할이 바뀌면 응답에 명확히 남겨라. 시스템이 이 세션 프로필에 기록한다.",
-        "- 비활성 에이전트는 이번 세션에서 발언/작업하지 않는다는 점을 고려한다.",
-    ]
+    if expose_file_paths:
+        lines = [
+            "세션 외부 메모리 (필요할 때만 파일을 직접 읽기):",
+            f"- 전체 기록 파일: {full_path}",
+            f"- 압축 요약 파일: {brief_path}",
+            f"- 세션 역할 프로필: {profile_path}",
+            f"- 사용자 확정 역할: {roles_path}",
+            f"- 전역 역할 강제 규칙: {ROLE_POLICY_PATH}",
+            f"- 활성 에이전트: {agent_names(enabled)}",
+            f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}",
+            "",
+            "규칙:",
+            "- 전체 기록과 Profile.md 전문은 현재 프롬프트에 포함되지 않았다.",
+            "- 역할 결정이나 과거 근거가 꼭 필요할 때만 해당 파일을 직접 읽는다.",
+            "- 역할은 모델이 스스로 바꾸지 않는다. 사용자가 대시보드에서 지정한 Roles.md의 현재 배정을 따른다.",
+            "- 비활성 에이전트는 이번 세션에서 발언/작업하지 않는다는 점을 고려한다.",
+        ]
+    else:
+        lines = [
+            "대화 전용 세션 문맥:",
+            f"- 활성 에이전트: {agent_names(enabled)}",
+            f"- 비활성 에이전트: {agent_names(disabled) if disabled else '없음'}",
+            "- 프로젝트 및 외부 메모리 파일 경로는 제공하지 않는다.",
+            "- 아래 인라인 요약과 최근 대화만 사용한다.",
+        ]
     if brief_tail:
         lines.extend(["", "짧은 세션 요약:", brief_tail])
+    validation_results = state.get("validation_results", [])
+    if validation_results:
+        lines.extend(["", "최근 자동 검증:"])
+        for result in validation_results[-6:]:
+            status = "통과" if result.get("ok") else "실패"
+            output = re.sub(r"\s+", " ", str(result.get("output", ""))).strip()[:180]
+            detail = f" - {output}" if output else ""
+            lines.append(f"- {result.get('label', '검증')}: {status}{detail}")
     context = "\n".join(lines)
     if len(context) > MEMORY_CONTEXT_MAX_CHARS:
         fixed = "\n".join(lines[:16])
@@ -1544,6 +1887,8 @@ def compose_agent_prompt(
     memory_context: str,
     transcript: str,
     instruction: str,
+    role_context: str = "",
+    project_context: str = "",
 ) -> str:
     team_prompt = team_prompt[:TEAM_PROMPT_MAX_CHARS]
     topic = topic[:500]
@@ -1557,7 +1902,9 @@ def compose_agent_prompt(
         f"사용자 승인이 꼭 필요하면 설명을 마친 뒤 마지막 줄에 {APPROVAL_TOKEN}만 쓴다. "
         f"승인이 필요하지 않으면 {APPROVAL_TOKEN}를 쓰지 않는다.\n\n"
     )
-    current_task = f"\n\n현재 주제: {topic}\n현재 작업: {instruction}\n"
+    policy_blocks = [block for block in (project_context, role_context) if block]
+    policy_block = "\n\n" + "\n\n".join(policy_blocks) if policy_blocks else ""
+    current_task = f"{policy_block}\n\n현재 주제: {topic}\n현재 작업: {instruction}\n"
     base = f"{header}{team_prompt}{current_task}"
     context_parts = []
     if memory_context:
@@ -1585,7 +1932,7 @@ STATE: dict = load_state()
 _RESTORED_INTERVENTIONS = list(STATE.get("pending_interventions", []))
 CONTROL = {
     "paused": False,
-    "stopped": False,
+    "stopped": bool(STATE.get("mode") == "continuous" and STATE.get("continuous_stopped")),
     "worker_running": False,
     "worker_session_id": None,
     "worker_start_pending": False,
@@ -1613,6 +1960,116 @@ def effective_cli_mode(requested_mode: str) -> str:
     return "coding" if requested_mode == "coding" else "discussion"
 
 
+def role_prompt(agent: str, state: dict) -> str:
+    role_id = normalize_agent_roles(state.get("agent_roles")).get(agent, "")
+    role = ROLE_CATALOG.get(role_id)
+    if not role:
+        return (
+            "확정 역할: 미지정. 사용자가 아직 역할 강제를 요청하지 않은 상태다. "
+            "현재 사용자 지시를 일반 작업자로서 수행하되, 다른 활성 모델과 변경 파일이 충돌하지 않도록 최근 대화를 확인한다."
+        )
+    return (
+        f"확정 역할: {role['label']}\n"
+        f"책임: {role['summary']}\n"
+        f"수정 허용 범위: {role['scope']}\n"
+        "강제 규칙: 사용자가 역할 선택 UI에서 바꾸기 전까지 이 역할을 유지한다. "
+        "다른 역할의 작업을 대신 수행하거나 담당 밖 파일을 수정하지 않는다. "
+        "범위 밖 작업은 담당 역할의 모델을 CALL_AGENT로 호출하고, 담당 모델이 없으면 사용자에게 배정 변경을 요청한다."
+    )
+
+
+def project_access_prompt(project_access: str) -> str:
+    if project_access == "write":
+        return (
+            "프로젝트 접근 권한: 읽기·쓰기. 현재 작업이 구현이나 수정을 명시하면 관련 파일을 먼저 확인한 뒤 "
+            "실제 구현과 검증까지 완료한다. 현재 작업이 토론·분석·계획만 요구하면 파일을 수정하지 않는다. "
+            "승인된 작업 범위와 사용자 지시를 벗어나지 않는다."
+        )
+    if project_access == "read":
+        return (
+            "프로젝트 접근: 읽기 전용. 답변 전에 프로젝트 구조와 관련 파일을 필요한 만큼 직접 확인한다. "
+            "파일을 생성·수정·삭제하지 않는다."
+        )
+    return (
+        "프로젝트 접근: 사용 안 함. 프로젝트 폴더와 파일을 열거나 검색하지 않는다. "
+        "현재 프롬프트에 포함된 사용자 메시지, 최근 대화와 인라인 요약만으로 토론한다. "
+        "현재 작업 지시의 파일 확인 문구보다 이 규칙을 우선한다."
+    )
+
+
+def role_scope_violations(agent: str, changed_paths: list[dict], state: dict) -> list[str]:
+    role_id = normalize_agent_roles(state.get("agent_roles")).get(agent, "")
+    role = ROLE_CATALOG.get(role_id)
+    if not role:
+        return []
+    if not role.get("can_write"):
+        return [item.get("path", "") for item in changed_paths if item.get("path")]
+    patterns = role.get("patterns", [])
+    violations = []
+    for item in changed_paths:
+        path = str(item.get("path", "")).replace("\\", "/")
+        if path and not any(fnmatch.fnmatch(path.lower(), pattern.lower()) for pattern in patterns):
+            violations.append(path)
+    return violations
+
+
+def update_agent_roles(roles: dict) -> dict:
+    normalized = normalize_agent_roles(roles)
+    selected = [role for role in normalized.values() if role]
+    if len(selected) != len(set(selected)):
+        return {"error": "세 모델에 같은 역할을 중복 배정할 수 없습니다."}
+    with STATE_LOCK:
+        if STATE.get("active_agent"):
+            return {"error": "모델이 실행 중일 때는 역할을 변경할 수 없습니다."}
+        previous = normalize_agent_roles(STATE.get("agent_roles"))
+        changes = []
+        for agent in AGENT_ORDER:
+            if previous[agent] != normalized[agent]:
+                changes.append({
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "agent": agent,
+                    "from": previous[agent],
+                    "to": normalized[agent],
+                })
+        STATE["agent_roles"] = normalized
+        STATE.setdefault("role_history", []).extend(changes)
+        del STATE["role_history"][:-100]
+        save_state(STATE)
+        snapshot = dict(STATE)
+    write_session_roles(snapshot)
+    if changes:
+        summary = ", ".join(
+            f"{AGENTS[item['agent']]['label']}={role_label(item['to'])}" for item in changes
+        )
+        add_runtime_event(f"사용자 역할 배정 변경: {summary}")
+    announce_roles_if_complete()
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
+
+
+def update_discussion_project_access(access: str) -> dict:
+    normalized = normalize_discussion_project_access(access)
+    if normalized == "write" and not os.access(load_project_path(), os.W_OK):
+        return {"error": "현재 프로젝트 폴더에 쓰기 권한이 없습니다."}
+    with STATE_LOCK:
+        if STATE.get("active_agent"):
+            return {"error": "현재 모델 응답이 끝난 뒤 토론 접근 방식을 변경해주세요."}
+        STATE["discussion_project_access"] = normalized
+        if normalized == "write":
+            STATE["workspace_access"] = "write"
+        save_state(STATE)
+    label = {
+        "write": "프로젝트 읽기·쓰기",
+        "read": "프로젝트 읽기",
+        "none": "읽지 않고 토론",
+    }[normalized]
+    add_runtime_event(f"일반 토론 프로젝트 접근 변경: {label}")
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
+
+
 def update_workspace_selection(path_text: str, access: str) -> dict:
     candidate = Path(path_text).expanduser()
     try:
@@ -1623,7 +2080,9 @@ def update_workspace_selection(path_text: str, access: str) -> dict:
         return {"error": "작업영역은 폴더만 선택할 수 있습니다."}
     if not os.access(candidate, os.R_OK):
         return {"error": "선택한 폴더에 읽기 권한이 없습니다."}
-    access = "write" if access == "write" else "read"
+    with STATE_LOCK:
+        coding_session = STATE.get("mode") in {"coding", "continuous"}
+    access = "write" if coding_session or access == "write" else "read"
     if access == "write" and not os.access(candidate, os.W_OK):
         return {"error": "선택한 폴더에 쓰기 권한이 없습니다."}
     try:
@@ -1641,20 +2100,46 @@ def update_workspace_selection(path_text: str, access: str) -> dict:
     return payload
 
 
-def unresolved_approval_requesters(messages: list[dict]) -> list[str]:
-    requesters: list[str] = []
+def unresolved_approval_requests(messages: list[dict]) -> list[dict]:
+    requests: list[dict] = []
     for message in reversed(messages):
         if message.get("agent") == "user" and message.get("phase") in {"승인", "승인 거절"}:
             break
         if not message.get("meta", {}).get("approval_requested"):
             continue
         agent = message.get("agent", "")
+        if agent not in AGENTS:
+            continue
         label = AGENTS.get(agent, {}).get("label", agent or "에이전트")
-        requester = f"{label} · {message.get('phase', '승인 요청')}"
-        if requester not in requesters:
-            requesters.append(requester)
-    requesters.reverse()
-    return requesters
+        request = {
+            "agent": agent,
+            "phase": message.get("phase", "승인 요청"),
+            "label": f"{label} · {message.get('phase', '승인 요청')}",
+        }
+        if request not in requests:
+            requests.append(request)
+    requests.reverse()
+    return requests
+
+
+def unresolved_approval_requesters(messages: list[dict]) -> list[str]:
+    return [request["label"] for request in unresolved_approval_requests(messages)]
+
+
+def orphaned_approval_followup_agents(messages: list[dict]) -> list[str]:
+    approval_index = next(
+        (
+            index for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("agent") == "user" and messages[index].get("phase") == "승인"
+        ),
+        -1,
+    )
+    if approval_index < 0 or any(message.get("agent") in AGENTS for message in messages[approval_index + 1:]):
+        return []
+    prior_requests = unresolved_approval_requests(messages[:approval_index])
+    return list(dict.fromkeys(
+        request["agent"] for request in prior_requests if request["phase"] != CONFIRM_PHASE
+    ))
 
 
 _restored_approval_requesters = unresolved_approval_requesters(STATE.get("messages", []))
@@ -1662,6 +2147,23 @@ if _restored_approval_requesters:
     CONTROL["approval_requested"] = True
     CONTROL["approval_requested_by"] = _restored_approval_requesters
     CONTROL["awaiting_approval"] = True
+
+_orphaned_approval_agents = orphaned_approval_followup_agents(STATE.get("messages", []))
+if _orphaned_approval_agents and not any(
+    item.get("approved_followup") for item in CONTROL["intervention_queue"]
+):
+    CONTROL["intervention_queue"].append({
+        "intent": "execute",
+        "targets": _orphaned_approval_agents,
+        "cli_mode": "coding",
+        "custom_instruction": "사용자가 직전 승인 요청을 승인했다. 승인받은 작업을 지금 실제로 수행하고 결과를 보고해라.",
+        "approved_followup": True,
+    })
+    CONTROL["intervention_pending"] = True
+    CONTROL["intervention_intent"] = "execute"
+    STATE["pending_interventions"] = json.loads(json.dumps(CONTROL["intervention_queue"], ensure_ascii=False))
+    STATE["finished"] = False
+    save_state(STATE)
 
 
 def add_runtime_event(text: str, level: str = "info") -> None:
@@ -1783,7 +2285,13 @@ def bubble_html(m: dict) -> str:
     agent = AGENTS[m["agent"]]
     side = agent["side"]
     phase = m.get("phase", "")
-    highlight_class = " report" if phase == "최종 보고" else (" confirm" if phase == CONFIRM_PHASE else "")
+    highlight_class = " system" if m["agent"] == "system" else (
+        " report" if phase == "최종 보고" else (" confirm" if phase == CONFIRM_PHASE else "")
+    )
+    avatar_html = (
+        f'<img class="avatar" src="{html.escape(agent["avatar"])}" alt="">'
+        if agent.get("avatar") else '<span class="system-avatar" aria-hidden="true">TC</span>'
+    )
 
     meta = m.get("meta")
     stats_html = ""
@@ -1844,7 +2352,7 @@ def bubble_html(m: dict) -> str:
     <div class="row {side}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
         <div class="meta">
-          <img class="avatar" src="{html.escape(agent.get('avatar', ''))}" alt="">
+          {avatar_html}
           <span class="name">{html.escape(agent['label'])}</span>
           <span class="phase">{html.escape(m.get('phase', ''))}</span>
           <span class="time">{html.escape(m['time'])}</span>
@@ -1878,6 +2386,8 @@ def status_text() -> str:
         return "\U0001f6d1 사용자 승인 대기 중"
     if CONTROL["paused"]:
         return "일시정지"
+    if STATE.get("mode") == "continuous":
+        return "무제한 코딩 진행 중"
     return "진행 중..."
 
 
@@ -1945,6 +2455,31 @@ def add_message(
     append_session_role_profile(session_id, agent, phase, text)
     render_html_snapshot()
     return True
+
+
+def announce_roles_if_complete(expected_session_id: str | None = None) -> bool:
+    with STATE_LOCK:
+        if expected_session_id and STATE.get("id") != expected_session_id:
+            return False
+        enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+        roles = normalize_agent_roles(STATE.get("agent_roles"))
+        if not enabled or any(not roles.get(agent) for agent in enabled):
+            return False
+        signature = "|".join(f"{agent}:{roles[agent]}" for agent in enabled)
+        if STATE.get("roles_announced_signature") == signature:
+            return False
+        STATE["roles_announced_signature"] = signature
+        save_state(STATE)
+        session_id = STATE.get("id")
+    lines = ["역할 배정이 확정되었습니다."]
+    lines.extend(
+        f"- **{AGENTS[agent]['label']}**: {role_label(roles[agent])}"
+        for agent in enabled
+    )
+    return add_message(
+        "system", "역할 배정 완료", "\n".join(lines),
+        expected_session_id=expected_session_id or session_id,
+    )
 
 
 INTERVENTION_INTENTS = {
@@ -2138,6 +2673,46 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
     return True
 
 
+def approve_pending_work() -> bool:
+    was_waiting = CONTROL["awaiting_approval"] or CONTROL["approval_requested"]
+    with STATE_LOCK:
+        approval_requests = unresolved_approval_requests(STATE.get("messages", []))
+    if was_waiting:
+        add_message("user", "승인", "승인")
+        add_runtime_event("사용자가 진행을 승인했습니다.")
+    CONTROL["awaiting_approval"] = False
+    CONTROL["approval_deferred"] = False
+    CONTROL["approval_requested"] = False
+    CONTROL["approval_requested_by"] = []
+    CONTROL["approval_rejected"] = False
+    followup_agents = list(dict.fromkeys(
+        request["agent"] for request in approval_requests if request["phase"] != CONFIRM_PHASE
+    ))
+    with STATE_LOCK:
+        if followup_agents:
+            CONTROL["intervention_queue"].append({
+                "intent": "execute",
+                "targets": followup_agents,
+                "cli_mode": "coding",
+                "custom_instruction": (
+                    "사용자가 방금 승인했다. 네가 승인을 요청했던 작업을 계획 보고로 끝내지 말고 "
+                    "지금 실제로 수행한 뒤 변경 내용과 검증 결과를 답해라."
+                ),
+                "approved_followup": True,
+            })
+            STATE["finished"] = False
+        CONTROL["intervention_pending"] = bool(CONTROL["intervention_queue"])
+        CONTROL["intervention_intent"] = (
+            CONTROL["intervention_queue"][0].get("intent", "")
+            if CONTROL["intervention_queue"] else ""
+        )
+        persist_intervention_queue_locked()
+    if CONTROL["intervention_pending"]:
+        add_runtime_event("승인된 후속 작업을 실행 큐에 등록했습니다.")
+        start_worker_if_needed(force=True)
+    return was_waiting
+
+
 def wait_for_user_approval(session_id: str) -> bool:
     with STATE_LOCK:
         if STATE.get("id") != session_id:
@@ -2187,18 +2762,8 @@ def run_step(
     delegation_depth: int = 0,
 ) -> bool:
     requested_cli_mode = cli_mode
-    cli_mode = effective_cli_mode(cli_mode)
-    if requested_cli_mode == "coding" and cli_mode != "coding":
-        instruction = (
-            f"{instruction}\n\n"
-            "현재 작업영역 권한은 읽기 전용이다. 파일을 생성·수정·삭제하지 말고, "
-            "분석 결과와 변경 제안만 보고해라."
-        )
-        add_runtime_event(f"{AGENTS[agent]['label']} 코딩 요청을 읽기 전용 분석으로 전환")
-    label = AGENTS[agent]["label"]
-    separator(f"{label} — {phase}")
     with STATE_LOCK:
-        budget_reason = budget_exceeded_reason(STATE)
+        budget_reason = None if STATE.get("mode") == "continuous" else budget_exceeded_reason(STATE)
     if budget_reason:
         CONTROL["paused"] = True
         add_runtime_event(f"예산 초과로 자동 일시정지: {budget_reason}", level="error")
@@ -2209,7 +2774,7 @@ def run_step(
             {
                 "elapsed": 0.0,
                 "est_tokens": 0,
-                "cli_mode": cli_mode,
+                "cli_mode": effective_cli_mode(cli_mode),
                 "prompt_chars": 0,
                 "output_chars": 0,
                 "raw_output_chars": 0,
@@ -2223,6 +2788,34 @@ def run_step(
             expected_session_id=expected_session_id,
         )
         return False
+    if requested_cli_mode == "coding":
+        with STATE_LOCK:
+            current_roles = normalize_agent_roles(STATE.get("agent_roles"))
+            role_id = current_roles.get(agent, "")
+            same_session = not expected_session_id or STATE.get("id") == expected_session_id
+        if not same_session:
+            return False
+        if role_id and not ROLE_CATALOG[role_id]["can_write"]:
+            cli_mode = "discussion"
+            instruction = (
+                f"{instruction}\n\n현재 역할은 {ROLE_CATALOG[role_id]['label']}이며 읽기 전용 역할이다. "
+                "파일을 수정하지 말고 검토 결과와 담당 모델에게 넘길 작업만 보고해라."
+            )
+            add_runtime_event(f"{AGENTS[agent]['label']} 코딩 요청을 역할 규칙에 따라 읽기 전용으로 전환")
+        else:
+            cli_mode = effective_cli_mode(cli_mode)
+    else:
+        cli_mode = effective_cli_mode(cli_mode)
+    cli_mode = effective_cli_mode(cli_mode)
+    if requested_cli_mode == "coding" and cli_mode != "coding" and workspace_access_mode() != "write":
+        instruction = (
+            f"{instruction}\n\n"
+            "현재 작업영역 권한은 읽기 전용이다. 파일을 생성·수정·삭제하지 말고, "
+            "분석 결과와 변경 제안만 보고해라."
+        )
+        add_runtime_event(f"{AGENTS[agent]['label']} 코딩 요청을 읽기 전용 분석으로 전환")
+    label = AGENTS[agent]["label"]
+    separator(f"{label} — {phase}")
     with STATE_LOCK:
         if expected_session_id and STATE.get("id") != expected_session_id:
             return False
@@ -2233,9 +2826,15 @@ def run_step(
             STATE["messages"],
             normalize_enabled_agents(STATE.get("enabled_agents")),
         )
-    memory_context = build_memory_context(state_snapshot)
+    project_access = turn_project_access(cli_mode, state_snapshot)
+    memory_context = build_memory_context(
+        state_snapshot, expose_file_paths=project_access != "none"
+    )
     team_prompt = load_team_prompt()
-    prompt = compose_agent_prompt(team_prompt, topic, memory_context, transcript, instruction)
+    prompt = compose_agent_prompt(
+        team_prompt, topic, memory_context, transcript, instruction,
+        role_prompt(agent, state_snapshot), project_access_prompt(project_access),
+    )
 
     with STATE_LOCK:
         if expected_session_id and STATE.get("id") != expected_session_id:
@@ -2285,6 +2884,7 @@ def run_step(
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
     changed_paths = compare_project_snapshots(before_snapshot, after_snapshot) if cli_mode == "coding" else []
+    scope_violations = role_scope_violations(agent, changed_paths, state_snapshot) if cli_mode == "coding" else []
     turn_diff = build_turn_diff(project_path, before_texts, changed_paths) if cli_mode == "coding" else ""
     checkpoint_path = save_turn_checkpoint(
         session_id,
@@ -2310,11 +2910,24 @@ def run_step(
     )
     call_clean_text, agent_calls = extract_agent_calls(raw_text, agent, cli_mode)
     visible_text, approval_requested = extract_approval_token(call_clean_text)
+    requested_role = extract_role_selection(visible_text) if phase in {"역할 선언", "역할 확정"} else ""
+    if phase in {"역할 선언", "역할 확정"}:
+        visible_text = strip_role_selection(visible_text)
+    if state_snapshot.get("mode") == "continuous":
+        approval_requested = False
     text, output_truncated = clip_agent_output(visible_text)
     if approval_requested and not text:
         text = "사용자 승인을 요청했습니다."
     est_tokens = estimate_tokens(prompt, raw_text)
-    failed = is_cli_failure(raw_text)
+    failed = is_cli_failure(raw_text) or bool(scope_violations)
+    if scope_violations:
+        violation_list = ", ".join(scope_violations[:8])
+        suffix = " ..." if len(scope_violations) > 8 else ""
+        text = (
+            f"{text}\n\n[역할 범위 위반] 담당 밖 파일 변경 {len(scope_violations)}개: "
+            f"{violation_list}{suffix}\n세션을 일시정지했습니다. 체크포인트에서 변경을 검토하거나 되돌려주세요."
+        ).strip()
+        CONTROL["paused"] = True
     approval_requested = approval_requested and not failed
     print(f"✅ {label} 응답 완료 — {elapsed:.1f}초, 추정 토큰 ~{est_tokens} "
           f"(입력 {len(prompt)}자 / 출력 {len(text)}자)")
@@ -2329,6 +2942,10 @@ def run_step(
         "output_truncated": output_truncated,
         "approval_requested": approval_requested,
         "ok": not failed,
+        "failure_kind": "role_scope" if scope_violations else ("cli" if failed else ""),
+        "role_id": normalize_agent_roles(state_snapshot.get("agent_roles")).get(agent, ""),
+        "role_label": role_label(normalize_agent_roles(state_snapshot.get("agent_roles")).get(agent, "")),
+        "role_scope_violations": scope_violations,
         "changed_paths": changed_paths[:100],
         "turn_diff": turn_diff,
         "checkpoint_path": checkpoint_path,
@@ -2337,6 +2954,12 @@ def run_step(
         "actual_cost_usd": actual_cost_usd,
         "agent_calls": agent_calls,
         "delegation_depth": delegation_depth,
+        "continuous_cycle": (
+            (int(state_snapshot.get("step_index", 0)) // max(1, len(steps_for_mode(
+                "continuous", normalize_enabled_agents(state_snapshot.get("enabled_agents"))
+            )))) + 1
+            if state_snapshot.get("mode") == "continuous" else 0
+        ),
         "shared_context": [
             {
                 "agent": message.get("agent", ""),
@@ -2367,6 +2990,10 @@ def run_step(
         f"{label} — {phase} {result_label} ({elapsed:.1f}초, 추정 토큰 ~{est_tokens})",
         level=level,
     )
+    if scope_violations:
+        add_runtime_event(
+            f"역할 범위 위반으로 일시정지: {', '.join(scope_violations[:6])}", level="error"
+        )
     if approval_requested:
         mark_approval_requested(agent, phase)
         add_runtime_event(f"승인 요청 감지: {label} · {phase}")
@@ -2379,7 +3006,15 @@ def run_step(
                 add_runtime_event(f"턴 체크포인트 저장: {checkpoint_path}")
         else:
             add_runtime_event("파일 변경 감지: 없음")
+    selected_role = ""
+    if not failed and phase in {"역할 선언", "역할 확정"}:
+        selected_role = choose_discussion_role(agent, requested_role)
+        meta["role_id"] = selected_role
+        meta["role_label"] = role_label(selected_role)
+        meta["role_auto_selected"] = True
     added = add_message(agent, phase, text, meta, expected_session_id=session_id)
+    if added and not failed and phase in {"역할 선언", "역할 확정"}:
+        announce_roles_if_complete(expected_session_id=session_id)
     if added and not failed and agent_calls:
         queue_agent_calls(agent, agent_calls, delegation_depth)
     return added and not failed
@@ -2396,13 +3031,14 @@ def worker_loop(session_id: str) -> None:
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
                 step_index = STATE["step_index"]
+                continuous = mode == "continuous"
             if CONTROL["approval_requested"]:
                 if not wait_for_user_approval(session_id):
                     break
                 continue
             if process_pending_intervention(session_id):
                 continue
-            if step_index >= len(steps):
+            if not continuous and step_index >= len(steps):
                 break
             if CONTROL["stopped"]:
                 break
@@ -2415,10 +3051,15 @@ def worker_loop(session_id: str) -> None:
             if process_pending_intervention(session_id):
                 continue
 
-            agent, phase, instruction, cli_mode = steps[step_index]
+            cycle_index = step_index % len(steps) if continuous else step_index
+            cycle_number = (step_index // len(steps)) + 1 if continuous else 0
+            agent, phase, instruction, cli_mode = steps[cycle_index]
+            display_phase = f"{phase} · 사이클 {cycle_number}" if continuous else phase
+            if continuous and cycle_index == 0:
+                add_runtime_event(f"무제한 코딩 사이클 {cycle_number} 시작")
             succeeded = run_step(
                 agent,
-                phase,
+                display_phase,
                 instruction,
                 cli_mode,
                 expected_session_id=session_id,
@@ -2436,9 +3077,16 @@ def worker_loop(session_id: str) -> None:
                 next_index = STATE["step_index"]
                 save_state(STATE)
 
-            if cli_mode == "coding" and (
-                next_index >= len(steps) or steps[next_index][1] == "최종 보고"
-            ):
+            next_cycle_index = next_index % len(steps) if continuous else next_index
+            if continuous and next_cycle_index == 0:
+                add_runtime_event(f"무제한 코딩 사이클 {cycle_number} 완료 · 다음 사이클 계속")
+            should_validate = cli_mode == "coding" and (
+                (continuous and steps[next_cycle_index][1] == "교차 검토")
+                or (not continuous and (
+                    next_index >= len(steps) or steps[next_index][1] == "최종 보고"
+                ))
+            )
+            if should_validate:
                 add_runtime_event("자동 검증 시작")
                 validation_results = run_project_validation(load_project_path())
                 with STATE_LOCK:
@@ -2468,7 +3116,11 @@ def worker_loop(session_id: str) -> None:
                 mode = STATE.get("mode", "discussion")
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
-                finished = STATE["step_index"] >= len(steps) and not CONTROL["stopped"]
+                finished = (
+                    mode != "continuous"
+                    and STATE["step_index"] >= len(steps)
+                    and not CONTROL["stopped"]
+                )
                 STATE["finished"] = finished
                 STATE["active_agent"] = None
                 STATE["active_phase"] = None
@@ -2503,6 +3155,9 @@ def start_worker_if_needed(force: bool = False) -> None:
         CONTROL["worker_session_id"] = session_id
         CONTROL["worker_start_pending"] = False
         CONTROL["stopped"] = False
+        if STATE.get("continuous_stopped"):
+            STATE["continuous_stopped"] = False
+            save_state(STATE)
     thread = threading.Thread(target=worker_loop, args=(session_id,), daemon=True)
     thread.start()
 
@@ -2536,7 +3191,25 @@ def connection_status_html() -> str:
     return "".join(items)
 
 
-MODE_LABELS = {"discussion": "일반 토론 모드", "coding": "코딩 모드"}
+MODE_LABELS = {
+    "discussion": "일반 토론 모드",
+    "coding": "코딩 모드",
+    "continuous": "무제한 코딩",
+}
+
+
+def mode_notice_html(mode: str, discussion_project_access: str = "read") -> str:
+    mode_label = MODE_LABELS.get(mode, mode)
+    if mode in {"coding", "continuous"}:
+        access_label = "프로젝트 읽기·쓰기"
+    else:
+        access_label = discussion_project_access_label(discussion_project_access)
+    return bubble_html({
+        "agent": "system",
+        "phase": "현재 세션 모드",
+        "time": "",
+        "text": f"현재 세션은 **{mode_label}**입니다.\n- 접근 범위: {access_label}",
+    })
 
 
 def select_options_html(options: list[tuple[str, str]], selected: str = "") -> str:
@@ -2579,6 +3252,7 @@ def topic_section_html(
     enabled_agents: list[str],
     active_id: str,
     agent_settings: dict | None = None,
+    discussion_project_access: str = "read",
 ) -> str:
     access_label = "읽기·쓰기" if workspace_access_mode() == "write" else "읽기 전용"
     project_path_line = (
@@ -2589,6 +3263,8 @@ def topic_section_html(
 
     if topic:
         mode_label = MODE_LABELS.get(mode, mode)
+        access_mode = normalize_discussion_project_access(discussion_project_access)
+        discussion_access_label = discussion_project_access_label(access_mode)
         disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
         settings_label = " · ".join(
             f'{AGENTS[agent]["label"]}: {agent_setting_label(agent, agent_settings)}'
@@ -2600,8 +3276,9 @@ def topic_section_html(
             f'<p>활성: {html.escape(agent_names(enabled_agents))} · 비활성: '
             f'{html.escape(agent_names(disabled_agents) if disabled_agents else "없음")}</p>'
             f'<p>모델: {html.escape(settings_label)}</p>'
+            f'<p>프로젝트 접근: {"읽기·쓰기 (코딩 실행)" if mode in {"coding", "continuous"} else html.escape(discussion_access_label)}</p>'
             f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
-            f'{project_path_line if mode == "coding" else ""}</div>'
+            f'{project_path_line if mode in {"coding", "continuous"} else ""}</div>'
         )
 
     return f"""
@@ -2609,8 +3286,15 @@ def topic_section_html(
         <p style="margin:0;color:var(--muted);font-size:13px">토론 주제를 입력하면 바로 시작합니다.</p>
         <textarea id="topicInput" placeholder="예: 네이버 쇼핑 최저가 비교 웹앱을 같이 만들 거야" autofocus></textarea>
         <div class="mode-choice">
-          <label><input type="radio" name="mode" value="discussion" checked> 일반 토론 모드 (읽기 전용, 강점/역할 논의)</label>
+          <label><input type="radio" name="mode" value="discussion" checked> 일반 토론 모드</label>
           <label><input type="radio" name="mode" value="coding"> 코딩 모드 (실제로 이 폴더 코드를 수정)</label>
+          <label><input type="radio" name="mode" value="continuous"> 무제한 코딩 (중단할 때까지 구현·검토 반복)</label>
+        </div>
+        <div class="discussion-access-choice">
+          <strong>일반 토론의 프로젝트 접근</strong>
+          <label><input type="radio" name="discussion_project_access" value="read" checked> 프로젝트 읽기</label>
+          <label><input type="radio" name="discussion_project_access" value="write"> 프로젝트 읽기·쓰기</label>
+          <label><input type="radio" name="discussion_project_access" value="none"> 프로젝트 읽지 않고 토론</label>
         </div>
         {agent_model_cards_html(agent_settings)}
         {project_path_line}
@@ -2626,12 +3310,19 @@ def render_dashboard() -> str:
         mode = STATE.get("mode", "discussion")
         enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
         agent_settings = normalize_agent_settings(STATE.get("agent_settings"))
+        discussion_project_access = normalize_discussion_project_access(
+            STATE.get("discussion_project_access")
+        )
         active_id = STATE.get("id", "")
-    bubbles = "".join(bubble_html(m) for m in messages) if messages else \
+    message_bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<div class="empty-state">아직 대화가 없습니다.</div>'
+    bubbles = (mode_notice_html(mode, discussion_project_access) if topic else "") + message_bubbles
     paused = CONTROL["paused"]
     stopped = CONTROL["stopped"]
-    topic_section = topic_section_html(topic, mode, enabled_agents, active_id, agent_settings)
+    topic_section = topic_section_html(
+        topic, mode, enabled_agents, active_id, agent_settings,
+        discussion_project_access,
+    )
 
     no_topic = "disabled" if not topic else ""
     pause_disabled = "disabled" if (not topic or finished or stopped or paused) else ""
@@ -2664,6 +3355,10 @@ def state_json_payload() -> dict:
         active_id = STATE.get("id", "")
         enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
         agent_settings = normalize_agent_settings(STATE.get("agent_settings"))
+        agent_roles = normalize_agent_roles(STATE.get("agent_roles"))
+        discussion_project_access = normalize_discussion_project_access(
+            STATE.get("discussion_project_access")
+        )
         total_est_tokens = STATE.get("total_est_tokens", 0)
         total_actual_tokens = STATE.get("total_actual_tokens", 0)
         total_actual_cost_usd = STATE.get("total_actual_cost_usd", 0.0)
@@ -2680,9 +3375,14 @@ def state_json_payload() -> dict:
         validation_results = list(STATE.get("validation_results", []))
         delegation_history = list(STATE.get("delegation_history", []))[-20:]
         workspace_access = STATE.get("workspace_access", "write")
+        step_index = int(STATE.get("step_index", 0))
+        state_snapshot = dict(STATE)
+    if active_id and not session_roles_path(active_id).exists():
+        ensure_session_memory(state_snapshot)
     active_elapsed = max(0.0, round(time.time() - active_started_at, 1)) if active_started_at else 0.0
-    bubbles = "".join(bubble_html(m) for m in messages) if messages else \
+    message_bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<div class="empty-state">아직 대화가 없습니다.</div>'
+    bubbles = (mode_notice_html(mode, discussion_project_access) if topic else "") + message_bubbles
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     last_model_message = next((message for message in reversed(messages) if message.get("agent") in AGENT_ORDER), None)
     can_retry = bool(
@@ -2690,7 +3390,9 @@ def state_json_payload() -> dict:
     )
     return {
         "feed_html": bubbles,
-        "topic_section_html": topic_section_html(topic, mode, enabled_agents, active_id, agent_settings),
+        "topic_section_html": topic_section_html(
+            topic, mode, enabled_agents, active_id, agent_settings, discussion_project_access
+        ),
         "status": status_text(),
         "finished": finished,
         "paused": CONTROL["paused"],
@@ -2709,8 +3411,16 @@ def state_json_payload() -> dict:
         "archived": bool(STATE.get("archived", False)),
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
+        "discussion_project_access": discussion_project_access,
+        "discussion_project_access_label": discussion_project_access_label(discussion_project_access),
         "enabled_agents": enabled_agents,
         "agent_settings": agent_settings,
+        "agent_roles": agent_roles,
+        "role_labels": {agent: role_label(agent_roles[agent]) for agent in AGENT_ORDER},
+        "role_catalog": [
+            {"id": role_id, "label": role["label"], "summary": role["summary"], "scope": role["scope"], "can_write": role["can_write"]}
+            for role_id, role in ROLE_CATALOG.items()
+        ],
         "agent_setting_labels": {
             agent: agent_setting_label(agent, agent_settings) for agent in AGENT_ORDER
         },
@@ -2720,6 +3430,7 @@ def state_json_payload() -> dict:
         "active_id": active_id,
         "memory_dir": html.escape(str(session_memory_dir(active_id))) if active_id else "",
         "profile_path": html.escape(str(session_profile_path(active_id))) if active_id else "",
+        "roles_path": html.escape(str(session_roles_path(active_id))) if active_id else "",
         "workspace_path": str(load_project_path()),
         "workspace_access": workspace_access,
         "workspace_access_label": "읽기·쓰기" if workspace_access == "write" else "읽기 전용",
@@ -2727,7 +3438,7 @@ def state_json_payload() -> dict:
         "total_actual_tokens": total_actual_tokens,
         "total_actual_cost_usd": total_actual_cost_usd,
         "budget": budget,
-        "budget_exceeded": budget_exceeded_reason({
+        "budget_exceeded": "" if mode == "continuous" else budget_exceeded_reason({
             "budget": budget,
             "total_actual_tokens": total_actual_tokens,
             "total_actual_cost_usd": total_actual_cost_usd,
@@ -2746,6 +3457,10 @@ def state_json_payload() -> dict:
         "validation_results": validation_results,
         "delegation_history": delegation_history,
         "delegation_count": STATE.get("delegation_count", 0),
+        "continuous_cycle": (
+            (step_index // max(1, len(steps_for_mode("continuous", enabled_agents)))) + 1
+            if mode == "continuous" else 0
+        ),
         "agent_usage": agent_usage_summary(messages),
         "context_usage": agent_context_summary(messages, agent_settings),
     }
@@ -2853,19 +3568,27 @@ def session_detail_payload(session_id: str) -> dict | None:
     if data is None:
         return None
     messages = data.get("messages", [])
-    bubbles = "".join(bubble_html(m) for m in messages) if messages else \
-        '<div class="empty-state">아직 대화가 없습니다.</div>'
     with STATE_LOCK:
         is_active = STATE.get("id") == session_id
     mode = data.get("mode", "discussion")
     enabled_agents = normalize_enabled_agents(data.get("enabled_agents"))
     agent_settings = normalize_agent_settings(data.get("agent_settings"))
+    agent_roles = normalize_agent_roles(data.get("agent_roles"))
+    discussion_project_access = normalize_discussion_project_access(
+        data.get("discussion_project_access")
+    )
+    message_bubbles = "".join(bubble_html(m) for m in messages) if messages else \
+        '<div class="empty-state">아직 대화가 없습니다.</div>'
+    bubbles = (
+        mode_notice_html(mode, discussion_project_access) if data.get("topic") else ""
+    ) + message_bubbles
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     return {
         "id": session_id,
         "feed_html": bubbles,
         "topic_section_html": topic_section_html(
-            data.get("topic", ""), mode, enabled_agents, session_id, agent_settings
+            data.get("topic", ""), mode, enabled_agents, session_id, agent_settings,
+            discussion_project_access,
         ),
         "topic": html.escape(data.get("topic", "")),
         "session_name": html.escape(data.get("name") or data.get("topic") or "새 세션"),
@@ -2874,8 +3597,16 @@ def session_detail_payload(session_id: str) -> dict | None:
         "archived": bool(data.get("archived", False)),
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
+        "discussion_project_access": discussion_project_access,
+        "discussion_project_access_label": discussion_project_access_label(discussion_project_access),
         "enabled_agents": enabled_agents,
         "agent_settings": agent_settings,
+        "agent_roles": agent_roles,
+        "role_labels": {agent: role_label(agent_roles[agent]) for agent in AGENT_ORDER},
+        "role_catalog": [
+            {"id": role_id, "label": role["label"], "summary": role["summary"], "scope": role["scope"], "can_write": role["can_write"]}
+            for role_id, role in ROLE_CATALOG.items()
+        ],
         "agent_setting_labels": {
             agent: agent_setting_label(agent, agent_settings) for agent in AGENT_ORDER
         },
@@ -2883,6 +3614,7 @@ def session_detail_payload(session_id: str) -> dict | None:
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "memory_dir": html.escape(str(session_memory_dir(session_id))),
         "profile_path": html.escape(str(session_profile_path(session_id))),
+        "roles_path": html.escape(str(session_roles_path(session_id))),
         "workspace_path": data.get("workspace_path") or str(load_project_path()),
         "workspace_access": data.get("workspace_access", "write"),
         "workspace_access_label": "읽기·쓰기" if data.get("workspace_access", "write") == "write" else "읽기 전용",
@@ -2902,6 +3634,10 @@ def session_detail_payload(session_id: str) -> dict | None:
         "validation_results": data.get("validation_results", []),
         "delegation_history": data.get("delegation_history", []),
         "delegation_count": data.get("delegation_count", 0),
+        "continuous_cycle": (
+            (int(data.get("step_index", 0)) // max(1, len(steps_for_mode("continuous", enabled_agents)))) + 1
+            if mode == "continuous" else 0
+        ),
     }
 
 
@@ -3024,11 +3760,17 @@ def prompt_preview_payload(agent: str) -> dict:
         step_index = int(STATE.get("step_index", 0))
     instruction = "현재 주제와 공유된 최신 발언을 검토하고, 자신의 역할에 맞는 다음 의견을 간결하게 정리해라."
     phase = "사용자 미리보기"
-    if step_index < len(steps) and steps[step_index][0] == agent:
-        _agent, phase, instruction, _cli_mode = steps[step_index]
+    preview_index = step_index % len(steps) if state.get("mode") == "continuous" and steps else step_index
+    if preview_index < len(steps) and steps[preview_index][0] == agent:
+        _agent, phase, instruction, cli_mode = steps[preview_index]
+    else:
+        cli_mode = "discussion"
+    project_access = turn_project_access(cli_mode, state)
     transcript, shared = build_shared_transcript(messages, enabled)
     prompt = compose_agent_prompt(
-        load_team_prompt(), state.get("topic", ""), build_memory_context(state), transcript, instruction
+        load_team_prompt(), state.get("topic", ""),
+        build_memory_context(state, expose_file_paths=project_access != "none"), transcript, instruction,
+        role_prompt(agent, state), project_access_prompt(project_access),
     )
     return {
         "agent": agent,
@@ -3084,6 +3826,8 @@ def save_profile_content(content: str, session_id: str | None = None) -> dict:
 def switch_mode(mode: str) -> dict:
     if mode not in MODE_LABELS:
         return {"error": "알 수 없는 모드입니다."}
+    if mode in {"coding", "continuous"} and not os.access(load_project_path(), os.W_OK):
+        return {"error": "코딩 모드는 작업 폴더의 쓰기 권한이 필요합니다."}
     with STATE_LOCK:
         if STATE.get("active_agent"):
             return {"error": "현재 모델 응답이 끝난 뒤 모드를 전환해주세요."}
@@ -3091,13 +3835,25 @@ def switch_mode(mode: str) -> dict:
         enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
         common_step_count = len([step for step in DISCUSSION_STEPS if step[0] in enabled])
         if previous_mode != mode:
-            if mode == "coding" and STATE.get("step_index", 0) >= common_step_count:
+            if mode == "continuous":
+                STATE["step_index"] = 0
+            elif previous_mode == "continuous":
+                STATE["step_index"] = common_step_count if mode == "coding" else 0
+            elif mode == "coding" and STATE.get("step_index", 0) >= common_step_count:
                 STATE["step_index"] = common_step_count
             elif mode == "discussion" and STATE.get("step_index", 0) > common_step_count:
                 STATE["step_index"] = common_step_count
         STATE["mode"] = mode
+        STATE["continuous_stopped"] = False
+        if mode in {"coding", "continuous"}:
+            STATE["workspace_access"] = "write"
+            STATE["discussion_project_access"] = "write"
         step_count = len(steps_for_mode(mode, enabled))
-        STATE["finished"] = bool(STATE.get("topic")) and STATE.get("step_index", 0) >= step_count
+        STATE["finished"] = (
+            mode != "continuous"
+            and bool(STATE.get("topic"))
+            and STATE.get("step_index", 0) >= step_count
+        )
         if not STATE["finished"]:
             CONTROL["stopped"] = False
         CONTROL["awaiting_approval"] = False
@@ -3277,6 +4033,9 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             form = self._read_form()
             topic = form.get("topic", [""])[0].strip()
             mode = form.get("mode", ["discussion"])[0].strip()
+            discussion_project_access = normalize_discussion_project_access(
+                form.get("discussion_project_access", ["read"])[0].strip()
+            )
             enabled_agents = normalize_enabled_agents(form.get("agent", []))
             agent_settings = normalize_agent_settings({
                 agent: {
@@ -3293,6 +4052,12 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     if not STATE.get("name") or STATE.get("name") == "새 세션":
                         STATE["name"] = topic[:80]
                     STATE["mode"] = mode
+                    STATE["continuous_stopped"] = False
+                    STATE["discussion_project_access"] = (
+                        "write" if mode in {"coding", "continuous"} else discussion_project_access
+                    )
+                    if mode in {"coding", "continuous"} or discussion_project_access == "write":
+                        STATE["workspace_access"] = "write"
                     STATE["enabled_agents"] = enabled_agents
                     STATE["agent_settings"] = agent_settings
                     STATE["finished"] = False
@@ -3318,6 +4083,20 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             form = self._read_form()
             mode = form.get("mode", ["discussion"])[0].strip()
             self._send_json(switch_mode(mode))
+            return
+
+        if self.path == "/discussion-access":
+            form = self._read_form()
+            access = form.get("access", ["read"])[0].strip()
+            self._send_json(update_discussion_project_access(access))
+            return
+
+        if self.path == "/roles":
+            form = self._read_form()
+            self._send_json(update_agent_roles({
+                agent: form.get(f"role_{agent}", [""])[0].strip()
+                for agent in AGENT_ORDER
+            }))
             return
 
         if self.path == "/profile":
@@ -3391,7 +4170,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 current_mode = STATE.get("mode", "discussion")
             effective_intent = intent
-            if intent == "redirect" and source == "composer" and current_mode == "coding":
+            if intent == "redirect" and source == "composer" and current_mode in {"coding", "continuous"}:
                 effective_intent = "execute"
             requested_targets = form.get("target")
             targets = normalize_target_agents(requested_targets)
@@ -3466,7 +4245,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
             with STATE_LOCK:
+                if STATE.get("mode") == "continuous":
+                    STATE["continuous_stopped"] = True
                 persist_intervention_queue_locked()
+                save_state(STATE)
             if cancelled:
                 add_runtime_event(f"실행 중 CLI 강제 종료: {', '.join(cancelled)}")
             self._send_json(state_json_payload())
@@ -3478,6 +4260,9 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 return
             CONTROL["paused"] = False
             CONTROL["stopped"] = False
+            with STATE_LOCK:
+                STATE["continuous_stopped"] = False
+                save_state(STATE)
             add_runtime_event("실패한 턴을 다시 실행합니다.")
             start_worker_if_needed(force=True)
             self._send_json(state_json_payload())
@@ -3511,20 +4296,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/approve":
-            was_waiting = CONTROL["awaiting_approval"] or CONTROL["approval_requested"]
-            if was_waiting:
-                add_message("user", "승인", "승인")
-                add_runtime_event("사용자가 진행을 승인했습니다.")
-            CONTROL["awaiting_approval"] = False
-            CONTROL["approval_deferred"] = False
-            CONTROL["approval_requested"] = False
-            CONTROL["approval_requested_by"] = []
-            CONTROL["approval_rejected"] = False
-            CONTROL["intervention_pending"] = False
-            CONTROL["intervention_intent"] = ""
-            CONTROL["intervention_queue"] = []
-            with STATE_LOCK:
-                persist_intervention_queue_locked()
+            approve_pending_work()
             self._send_json(state_json_payload())
             return
 
