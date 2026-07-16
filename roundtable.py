@@ -83,6 +83,28 @@ ACTIVE_PROCESS_LOCK = threading.Lock()
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 
 
+def terminate_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+
+
 def cancel_active_cli_processes() -> list[str]:
     cancelled = []
     with ACTIVE_PROCESS_LOCK:
@@ -91,12 +113,7 @@ def cancel_active_cli_processes() -> list[str]:
         if process.poll() is not None:
             continue
         try:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
+            terminate_process_tree(process)
             cancelled.append(tool_name)
         except (OSError, subprocess.SubprocessError):
             continue
@@ -1094,7 +1111,7 @@ def run_cli(
             deadline = time.monotonic() + timeout if timeout else None
             while closed_streams < 2:
                 if deadline and time.monotonic() >= deadline:
-                    process.kill()
+                    terminate_process_tree(process)
                     raise subprocess.TimeoutExpired(cmd, timeout)
                 try:
                     stream_name, raw_line = output_queue.get(timeout=0.2)
@@ -1214,21 +1231,30 @@ def is_incomplete_tool_response(text: str) -> bool:
 def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str:
     project_access = turn_project_access(mode)
     sandbox = "workspace-write" if project_access == "write" else "read-only"
+    working_directory = cli_working_directory(mode)
     setting = selected_agent_setting("codex")
-    args = ["exec", "--ephemeral", "--ignore-user-config"]
+    args = ["exec", "--ephemeral"]
+    # Codex CLI 0.144+ treats --ignore-user-config as read-only in managed desktop
+    # sessions even when --sandbox workspace-write is supplied.
+    if project_access != "write":
+        args.append("--ignore-user-config")
     if mode == "discussion":
         args.append("--ignore-rules")
     if setting["model"]:
         args.extend(["--model", setting["model"]])
     if setting["effort"]:
         args.extend(["--config", f'model_reasoning_effort="{setting["effort"]}"'])
-    args.extend(["--sandbox", sandbox, "--skip-git-repo-check", "--json", "-"])
+    args.extend([
+        "--sandbox", sandbox,
+        "--cd", str(working_directory),
+        "--skip-git-repo-check", "--json", "-",
+    ])
     result = run_cli(
         "Codex",
         CODEX_CMD,
         args,
         timeout=CODEX_TIMEOUT,
-        cwd=cli_working_directory(mode),
+        cwd=working_directory,
         input_text=prompt,
         stream_events=True,
         event_callback=event_callback,
@@ -1305,7 +1331,11 @@ def ask_antigravity(prompt: str, mode: str = "discussion", event_callback=None) 
     if setting["model"]:
         base_args.extend(["--model", setting["model"]])
     if project_access == "write":
-        args = base_args + ["--mode", "accept-edits", "--print", prompt]
+        args = base_args + [
+            "--mode", "accept-edits",
+            "--dangerously-skip-permissions",
+            "--print", prompt,
+        ]
     else:
         args = base_args + ["--mode", "plan", "--sandbox", "--print", prompt]
     result = run_cli(
@@ -2641,7 +2671,9 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
     source_label = AGENTS.get(source_agent, {}).get("label", "사용자")
     event_prefix = f"{source_label} 호출" if intent == "delegation" else "사용자 개입"
     add_runtime_event(f"{event_prefix} 처리 시작: {spec['label']} → {agent_names(targets)}")
-    for responder in targets:
+    for target_index, responder in enumerate(targets):
+        if CONTROL["stopped"]:
+            return True
         custom_instruction = item.get("custom_instruction", "")
         target_instruction = (
             f"{spec['instruction']}\n\n"
@@ -2658,11 +2690,14 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
             expected_session_id=expected_session_id,
             delegation_depth=int(item.get("delegation_depth", 0)),
         ):
+            retry_item = dict(item)
+            retry_item["targets"] = targets[target_index:]
             with STATE_LOCK:
-                CONTROL["intervention_queue"].insert(0, item)
-                CONTROL["intervention_pending"] = True
-                CONTROL["intervention_intent"] = item["intent"]
-                CONTROL["paused"] = True
+                if not CONTROL["stopped"]:
+                    CONTROL["intervention_queue"].insert(0, retry_item)
+                    CONTROL["intervention_pending"] = True
+                    CONTROL["intervention_intent"] = retry_item["intent"]
+                    CONTROL["paused"] = True
                 persist_intervention_queue_locked()
             return True
     with STATE_LOCK:

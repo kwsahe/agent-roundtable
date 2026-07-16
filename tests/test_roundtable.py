@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import roundtable
 
@@ -99,11 +99,17 @@ class RoundtableTests(unittest.TestCase):
                 args = run_cli.call_args.args[2]
                 if agent == "codex":
                     self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+                    self.assertNotIn("--ignore-user-config", args)
+                    self.assertEqual(
+                        Path(args[args.index("--cd") + 1]),
+                        roundtable.load_project_path(),
+                    )
                 elif agent == "claude":
                     self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
                     self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
                 else:
                     self.assertEqual(args[args.index("--mode") + 1], "accept-edits")
+                    self.assertIn("--dangerously-skip-permissions", args)
 
     def test_all_agents_receive_write_access_in_writable_discussion(self):
         roundtable.STATE["mode"] = "discussion"
@@ -116,17 +122,31 @@ class RoundtableTests(unittest.TestCase):
                 args = run_cli.call_args.args[2]
                 if agent == "codex":
                     self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+                    self.assertNotIn("--ignore-user-config", args)
                 elif agent == "claude":
                     self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
                     self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
                 else:
                     self.assertEqual(args[args.index("--mode") + 1], "accept-edits")
+                    self.assertIn("--dangerously-skip-permissions", args)
 
     def test_coding_mode_grants_write_access_to_every_turn(self):
         state = roundtable.new_state()
         state["mode"] = "coding"
         self.assertEqual(roundtable.turn_project_access("discussion", state), "write")
         self.assertEqual(roundtable.turn_project_access("coding", state), "write")
+
+    def test_codex_read_only_turn_keeps_isolated_user_config(self):
+        roundtable.STATE["mode"] = "discussion"
+        roundtable.STATE["discussion_project_access"] = "read"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_codex("프로젝트 확인", "discussion")
+
+        args = run_cli.call_args.args[2]
+        self.assertIn("--ignore-user-config", args)
+        self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
 
     def test_discussion_mode_can_grant_write_access(self):
         state = roundtable.new_state()
@@ -854,6 +874,7 @@ class RoundtableTests(unittest.TestCase):
         roundtable.STATE["enabled_agents"] = ["claude"]
         roundtable.CONTROL["intervention_queue"] = [{"intent": "execute", "targets": ["claude"], "cli_mode": "coding"}]
         roundtable.CONTROL["intervention_pending"] = True
+        roundtable.CONTROL["stopped"] = False
         handled = roundtable.process_pending_intervention(roundtable.STATE["id"])
         self.assertTrue(handled)
         self.assertEqual(run_step.call_args.args[3], "coding")
@@ -866,6 +887,7 @@ class RoundtableTests(unittest.TestCase):
         item = {"intent": "execute", "targets": ["antigravity"], "cli_mode": "coding"}
         roundtable.CONTROL["intervention_queue"] = [item]
         roundtable.CONTROL["intervention_pending"] = True
+        roundtable.CONTROL["stopped"] = False
 
         handled = roundtable.process_pending_intervention(roundtable.STATE["id"])
 
@@ -874,6 +896,67 @@ class RoundtableTests(unittest.TestCase):
         self.assertTrue(roundtable.CONTROL["intervention_pending"])
         self.assertEqual(roundtable.CONTROL["intervention_queue"], [item])
         self.assertEqual(roundtable.STATE["pending_interventions"], [item])
+
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "run_step", side_effect=[True, False])
+    @patch.object(roundtable, "save_state")
+    def test_multi_agent_retry_keeps_only_failed_and_unattempted_targets(
+        self, _save_state, run_step, _event
+    ):
+        roundtable.STATE["enabled_agents"] = ["codex", "antigravity", "claude"]
+        item = {
+            "intent": "execute",
+            "targets": ["codex", "antigravity", "claude"],
+            "cli_mode": "coding",
+        }
+        roundtable.CONTROL["intervention_queue"] = [item]
+        roundtable.CONTROL["intervention_pending"] = True
+        roundtable.CONTROL["stopped"] = False
+
+        handled = roundtable.process_pending_intervention(roundtable.STATE["id"])
+
+        self.assertTrue(handled)
+        self.assertEqual(run_step.call_count, 2)
+        self.assertEqual(
+            roundtable.CONTROL["intervention_queue"][0]["targets"],
+            ["antigravity", "claude"],
+        )
+
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "run_step", return_value=False)
+    @patch.object(roundtable, "save_state")
+    def test_stopped_intervention_does_not_restore_retry_queue(
+        self, _save_state, run_step, _event
+    ):
+        roundtable.STATE["enabled_agents"] = ["codex"]
+        roundtable.CONTROL["intervention_queue"] = [
+            {"intent": "execute", "targets": ["codex"], "cli_mode": "coding"}
+        ]
+        roundtable.CONTROL["intervention_pending"] = True
+        roundtable.CONTROL["stopped"] = False
+
+        def stop_during_run(*_args, **_kwargs):
+            roundtable.CONTROL["stopped"] = True
+            return False
+
+        run_step.side_effect = stop_during_run
+        handled = roundtable.process_pending_intervention(roundtable.STATE["id"])
+
+        self.assertTrue(handled)
+        self.assertEqual(roundtable.CONTROL["intervention_queue"], [])
+        self.assertFalse(roundtable.CONTROL["intervention_pending"])
+
+    @patch.object(roundtable, "terminate_process_tree")
+    def test_cancel_active_cli_processes_terminates_process_tree(self, terminate):
+        process = Mock()
+        process.poll.side_effect = [None, 0]
+        roundtable.ACTIVE_PROCESSES["Codex"] = process
+
+        cancelled = roundtable.cancel_active_cli_processes()
+
+        self.assertEqual(cancelled, ["Codex"])
+        terminate.assert_called_once_with(process)
+        self.assertNotIn("Codex", roundtable.ACTIVE_PROCESSES)
 
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "save_state")
