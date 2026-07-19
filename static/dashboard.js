@@ -35,6 +35,11 @@ function formatTime(value) {
   return `${Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}초`;
 }
 
+function compactSessionTitle(value) {
+  const normalized = String(value || "새 세션").replace(/\s+/g, " ").trim();
+  return normalized.length > 56 ? `${normalized.slice(0, 56)}…` : normalized;
+}
+
 function estimateCost(tokens) {
   return `$${((Number(tokens || 0) * 0.002) / 1000).toFixed(4)}`;
 }
@@ -353,7 +358,9 @@ function updateInspector(data) {
   lastState.latestPayload = data;
   lastState.active_id = data.active_id || data.id || lastState.active_id;
   if (lastState.sessionName !== data.session_name) {
-    $("sessionTitle").textContent = data.session_name || "새 세션";
+    const fullSessionTitle = data.session_name || "새 세션";
+    $("sessionTitle").textContent = compactSessionTitle(fullSessionTitle);
+    $("sessionTitle").title = fullSessionTitle.replace(/\s+/g, " ").trim();
     lastState.sessionName = data.session_name;
   }
   if (lastState.sideStatus !== data.status) {

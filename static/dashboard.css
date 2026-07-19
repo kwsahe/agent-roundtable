@@ -376,11 +376,12 @@ button.danger {
   max-width: 880px;
   width: 100%;
   margin: 0 auto 10px;
-  padding: 16px;
-  display: flex;
-  justify-content: space-between;
+  min-height: 58px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   flex: 0 0 auto;
 }
 
@@ -414,7 +415,8 @@ button.danger {
 }
 
 .thread-header h2 {
-  font-size: 22px;
+  font-size: 17px;
+  line-height: 1.25;
 }
 
 .session-heading {
@@ -463,10 +465,25 @@ button.danger {
 }
 
 .header-state {
-  display: grid;
-  justify-items: end;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
   gap: 4px;
   min-width: 0;
+}
+
+.header-state #headerConnection,
+.header-state #headerAgent {
+  display: none;
+}
+
+.header-state .status-pill,
+.header-state .mode-pill {
+  max-width: 156px;
+  overflow: hidden;
+  padding: 4px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mode-pill {
@@ -1922,7 +1939,7 @@ select:focus {
   }
 
   .thread-header {
-    min-height: 58px;
+    min-height: 74px;
     padding: 10px;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1938,7 +1955,7 @@ select:focus {
     grid-column: 1;
     grid-row: 2;
     justify-items: start;
-    grid-template-columns: auto minmax(0, 1fr);
+    justify-content: flex-start;
     align-items: center;
   }
 
@@ -1958,7 +1975,7 @@ select:focus {
   }
 
   .header-state .status-pill {
-    max-width: 118px;
+    max-width: 132px;
     overflow: hidden;
     text-overflow: ellipsis;
   }

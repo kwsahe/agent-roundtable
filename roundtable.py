@@ -1689,7 +1689,6 @@ def ensure_session_memory(state: dict) -> None:
     if not brief_path.exists():
         brief_path.write_text(header + "\n## 압축 요약\n", encoding="utf-8")
     profile_path = session_profile_path(session_id)
-    roles_path = session_roles_path(session_id)
     if not profile_path.exists():
         profile_path.write_text(SESSION_PROFILE_TEMPLATE, encoding="utf-8")
     write_session_roles(state)
@@ -2076,6 +2075,10 @@ def role_scope_violations(agent: str, changed_paths: list[dict], state: dict) ->
         if top_level in {
             ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
             "__pycache__", "roundtable_memory", "sessions",
+        }:
+            continue
+        if top_level in {"data", "instance"} and Path(path).suffix.lower() in {
+            ".db", ".sqlite", ".sqlite3", ".db-journal", ".db-wal", ".db-shm",
         }:
             continue
         if path in {"TODO.md", "AGENTS.md"}:
@@ -4258,7 +4261,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     STATE["topic"] = topic
                     if not STATE.get("name") or STATE.get("name") == "새 세션":
-                        STATE["name"] = topic[:80]
+                        STATE["name"] = re.sub(r"\s+", " ", topic).strip()[:80]
                     STATE["mode"] = mode
                     STATE["continuous_stopped"] = False
                     STATE["discussion_project_access"] = (

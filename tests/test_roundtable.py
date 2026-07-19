@@ -481,6 +481,16 @@ class RoundtableTests(unittest.TestCase):
         ]
         self.assertEqual(roundtable.role_scope_violations("codex", changed, state), [])
 
+    def test_role_scope_ignores_runtime_databases(self):
+        state = roundtable.new_state()
+        state["agent_roles"]["codex"] = "backend"
+        changed = [
+            {"path": "collector.py", "change": "modified"},
+            {"path": "data/app.db", "change": "modified"},
+            {"path": "instance/cache.sqlite3", "change": "created"},
+        ]
+        self.assertEqual(roundtable.role_scope_violations("codex", changed, state), [])
+
     def test_failed_workflow_step_can_continue_without_repeating(self):
         state = roundtable.new_state()
         state.update(

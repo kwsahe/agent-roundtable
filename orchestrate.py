@@ -342,7 +342,7 @@ def git_commit(round_num: int):
     if result.returncode == 0:
         print(f"  ✅ 커밋: {msg}")
     else:
-        print(f"  ⚠️  커밋 없음 (변경사항 없거나 실패)")
+        print("  ⚠️  커밋 없음 (변경사항 없거나 실패)")
 
 
 # ──────────────────────────────────────────
@@ -398,7 +398,7 @@ def main():
 
     except KeyboardInterrupt:
         print(f"\n\n🛑 루프 중단. 총 {round_num}라운드 완료.")
-        print(f"   TODO.md에서 진행 히스토리를 확인하세요.")
+        print("   TODO.md에서 진행 히스토리를 확인하세요.")
         sys.exit(0)
 
 
